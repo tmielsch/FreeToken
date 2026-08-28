@@ -40,10 +40,19 @@ def _patch_tvm_ffi_windows_cuda_flags() -> None:
     @functools.wraps(generate)
     def generate_ninja_build(*args, **kwargs):
         ninja = generate(*args, **kwargs)
-        return ninja.replace(
+        # tvm-ffi defaults to /std:c++17 for the host pass but the kernels
+        # require C++20 (std::span, concepts, source_location). Promote it.
+        ninja = ninja.replace(
             "-Xcompiler /std:c++17 /O2",
-            "-Xcompiler /std:c++17 -Xcompiler /O2",
+            "-Xcompiler /std:c++20 -Xcompiler /O2",
+        ).replace(
+            "-Xcompiler /std:c++17",
+            "-Xcompiler /std:c++20",
         )
+        # Keep the non-CUDA C++ path on C++20 as well; the alias is harmless
+        # on the already-correct FreeToken C++ build but fixes tvm-ffi's default.
+        ninja = ninja.replace("/std:c++17", "/std:c++20")
+        return ninja
 
     extension._generate_ninja_build = generate_ninja_build
     extension._freetoken_windows_cuda_flags_patch = True
