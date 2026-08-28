@@ -43,6 +43,8 @@ dependencies = [
     "huggingface_hub>=1.5,<2",
     "msgpack>=1.1,<2",
     "modelscope>=1.37,<2",
+    # torch.utils.cpp_extension.load() uses Ninja for runtime JIT CUDA/C++ kernels.
+    "ninja>=1.11,<2",
     # ceiling: numba (via flashlib) needs numpy<2.5
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
