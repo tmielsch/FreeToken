@@ -39,6 +39,12 @@ class Qwen4ExpArgs:
     output_gate_type: str
     mrope_section: tuple[int, int, int]
     mrope_interleaved: bool
+    # GGUF-only metadata. These defaults keep the safetensors/HF path unchanged.
+    # Routed expert types are stored per decoder layer as (gate_up_type, down_type).
+    # Unsloth Dynamic/UD checkpoints may vary these types by layer.
+    gguf_model_path: str | None = None
+    gguf_embed_quant: int | None = None
+    gguf_expert_types: tuple[tuple[int, int], ...] | None = None
 
 
 __all__ = ["Qwen4ExpArgs", "Qwen4VisionConfig"]
