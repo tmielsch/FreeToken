@@ -1,54 +1,84 @@
 #!/usr/bin/env python3
 """Inspect a Qwen3.8-Flash-Next GGUF without reading model weight payloads.
 
-Designed for large Unsloth Dynamic/UD split GGUFs. ``gguf.GGUFReader`` mmaps the
-files; this script walks tensor metadata and reports the per-layer quant types,
-especially the routed MoE experts whose type/row-size determines FreeToken's
-expert-cache layout.
+Designed for large Unsloth Dynamic/UD GGUFs, including llama.cpp split files.
+The script intentionally does not import ``freetoken``: it only needs the small
+``gguf`` Python package, so it can run before the full FreeToken environment is
+installed. ``GGUFReader`` memory-maps the file and this script walks tensor
+metadata to report quant types and routed-expert geometry.
 
 Usage:
-    python scripts/inspect-qwen38-gguf.py /path/to/*-00001-of-00003.gguf
-    python scripts/inspect-qwen38-gguf.py /path/to/UD-Q3_K_XL/
+    python scripts/inspect-qwen38-gguf.py /path/to/model.gguf
+    python scripts/inspect-qwen38-gguf.py /path/to/model-00001-of-00003.gguf
+    python scripts/inspect-qwen38-gguf.py /path/to/model-directory/
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import glob
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 
-def _bootstrap_repo() -> None:
-    root = Path(__file__).resolve().parents[1]
-    python_dir = root / "python"
-    if str(python_dir) not in sys.path:
-        sys.path.insert(0, str(python_dir))
-
-
-_bootstrap_repo()
-
-from freetoken.models.gguf.reader import (  # noqa: E402
-    gguf_config_source,
-    gguf_split_paths,
+_SPLIT_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.IGNORECASE,
 )
-
 
 _EXPERT_RE = re.compile(
     r"^blk\.(?P<layer>\d+)\.(?P<proj>ffn_gate_exps|ffn_up_exps|ffn_down_exps)\.weight$"
 )
 
 
+def _split_paths(model_path: str) -> tuple[str, ...]:
+    path = os.path.abspath(model_path)
+    if not os.path.isfile(path) or not path.lower().endswith(".gguf"):
+        raise SystemExit(f"Not a GGUF file: {model_path}")
+
+    match = _SPLIT_RE.match(os.path.basename(path))
+    if match is None:
+        return (path,)
+
+    prefix = match.group("prefix")
+    count = int(match.group("count"))
+    folder = os.path.dirname(path)
+    paths = tuple(
+        os.path.join(folder, f"{prefix}-{index:05d}-of-{count:05d}.gguf")
+        for index in range(1, count + 1)
+    )
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise SystemExit(
+            f"Split GGUF is incomplete: expected {count} shards; missing "
+            f"{[os.path.basename(p) for p in missing]}"
+        )
+    return paths
+
+
 def _resolve(path: str) -> str:
-    if os.path.isdir(path):
-        resolved = gguf_config_source(path)
-        if resolved is None:
-            raise SystemExit(f"No unique GGUF family found in {path}")
-        return resolved
-    return gguf_split_paths(path)[0]
+    if not os.path.isdir(path):
+        return _split_paths(path)[0]
+
+    files = sorted(glob.glob(os.path.join(path, "*.gguf")))
+    if not files:
+        raise SystemExit(f"No GGUF files found in {path}")
+
+    candidates: list[str] = []
+    for file_path in files:
+        match = _SPLIT_RE.match(os.path.basename(file_path))
+        if match is None or int(match.group("index")) == 1:
+            candidates.append(file_path)
+
+    if len(candidates) != 1:
+        raise SystemExit(
+            f"Expected exactly one GGUF model family in {path}; found "
+            f"{[os.path.basename(p) for p in candidates]}"
+        )
+    return _split_paths(candidates[0])[0]
 
 
 def _type_name(tensor_type) -> str:
@@ -65,10 +95,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    import gguf
+    try:
+        import gguf
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Missing Python package 'gguf'. Install the FreeToken dependencies or run "
+            "`python -m pip install gguf`, then retry."
+        ) from exc
 
     first = _resolve(args.model)
-    shards = gguf_split_paths(first)
+    shards = _split_paths(first)
 
     all_types: collections.Counter[str] = collections.Counter()
     expert_layers: dict[int, dict[str, dict]] = collections.defaultdict(dict)
@@ -96,8 +132,6 @@ def main() -> None:
                 rows_per_expert = 1
                 for value in ne[1:-1]:
                     rows_per_expert *= value
-                # qwen4exp expert tensors are [fast input, output, experts] in ggml order.
-                # One expert therefore owns rows_per_expert contiguous quantized rows.
                 expert_layers[layer][proj] = {
                     "type": qtype,
                     "ggml_type": int(tensor.tensor_type),
