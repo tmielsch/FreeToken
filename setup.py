@@ -51,9 +51,13 @@ def _cxx_args(*, cpu_moe: bool = False) -> list[str]:
     -std=c++17, and -pthread through cl.exe merely produces D9002 warnings and
     makes Windows builds unnecessarily fragile. Use native MSVC spellings there;
     the CPU MoE extension does not need a separate pthread flag on Windows.
+
+    CUDA/Torch headers can pull in Windows headers that define ``min`` and
+    ``max`` macros. Those corrupt ordinary C++ calls such as ``std::min(...)``
+    in cpu_moe_ext.cpp, so suppress them globally for native Windows builds.
     """
     if os.name == "nt":
-        return ["/O2", "/std:c++17"]
+        return ["/O2", "/std:c++17", "/DNOMINMAX"]
     args = ["-O3", "-std=c++17"]
     if cpu_moe:
         args.append("-pthread")
