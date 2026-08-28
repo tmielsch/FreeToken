@@ -3,16 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
 from freetoken.models.gguf.config import GgufConfigShim
+from freetoken.models.gguf.dequant import GGML_IQ3_XXS, GGML_IQ4_NL, GGML_Q8_0
 from freetoken.models.gguf.reader import gguf_config_source, gguf_split_paths
 from freetoken.models.qwen4_exp.gguf import parse_gguf_config
+from freetoken.models.qwen4_exp.gguf_weights import _resident_name, _ungroup_v
 
 
 def _metadata() -> dict:
     # Geometry of the released Qwen3.8-Flash-Next, expressed through the
-    # llama.cpp qwen4exp GGUF metadata contract. No model weights are needed.
-    ratios = [4 if i % 4 == 2 else 0 for i in range(48)]
+    # llama.cpp qwen4exp GGUF metadata contract. The real Unsloth tensor map has
+    # QSA on zero-based decoder layers 3,7,11,...,47.
+    ratios = [4 if i % 4 == 3 else 0 for i in range(48)]
     return {
         "qwen4exp.block_count": 48,
         "qwen4exp.embedding_length": 2560,
@@ -51,7 +55,20 @@ def _metadata() -> dict:
     }
 
 
-def test_qwen4exp_gguf_config_matches_released_geometry():
+def _fake_geometry(num_layers: int):
+    # Representative dominant signature from the user's Unsloth UD-Q3_K_XL:
+    # gate/up IQ3_XXS, down IQ4_NL. Header-only parsing is tested separately
+    # against actual files; this unit test deliberately needs no multi-GB GGUF.
+    return GGML_Q8_0, tuple(
+        (GGML_IQ3_XXS, GGML_IQ4_NL) for _ in range(num_layers)
+    )
+
+
+def test_qwen4exp_gguf_config_matches_released_geometry(monkeypatch):
+    monkeypatch.setattr(
+        "freetoken.models.qwen4_exp.gguf._gguf_geometry",
+        lambda _path, num_layers: _fake_geometry(num_layers),
+    )
     shim = GgufConfigShim(
         architectures=["Qwen4ExpGGUFForCausalLM"],
         model_path="unused.gguf",
@@ -78,10 +95,38 @@ def test_qwen4exp_gguf_config_matches_released_geometry():
     assert config.qwen4_args.ple_layer_ids == (1,)
     assert config.qwen4_args.ple_embed_dim == 2560
     assert config.qwen4_args.indexer_compress_ratio == 4
+    assert config.qwen4_args.gguf_embed_quant == GGML_Q8_0
+    assert len(config.qwen4_args.gguf_expert_types) == 48
     assert config.is_linear_layer(0)
     assert config.is_linear_layer(1)
-    assert not config.is_linear_layer(2)
-    assert config.is_linear_layer(3)
+    assert config.is_linear_layer(2)
+    assert not config.is_linear_layer(3)
+    assert not config.is_linear_layer(47)
+
+
+def test_qwen4exp_filtered_resident_iterator_never_selects_ple_or_routed_experts():
+    assert not _resident_name("per_layer_token_embd.weight", 48)
+    for suffix in (
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ):
+        assert not _resident_name(f"blk.7.{suffix}", 48)
+    assert _resident_name("blk.7.ffn_gate_shexp.weight", 48)
+    assert _resident_name("blk.7.attn_q.weight", 48)
+
+
+def test_qwen4exp_inverse_v_head_tiling_order():
+    # GGUF tiled order [R,K,D] -> FreeToken grouped order [K,R,D].
+    tiled = torch.arange(6)
+    grouped = _ungroup_v(
+        tiled,
+        dim=0,
+        num_k_heads=2,
+        num_v_per_k=3,
+        head_dim=1,
+    )
+    assert grouped.tolist() == [0, 2, 4, 1, 3, 5]
 
 
 def test_split_gguf_resolves_all_unsloth_style_shards(tmp_path: Path):
