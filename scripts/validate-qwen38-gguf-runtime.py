@@ -25,6 +25,7 @@ if str(PYTHON) not in sys.path:
 
 import torch
 
+from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.models import create_model
 from freetoken.models.gguf.config import build_gguf_shim
 from freetoken.models.gguf.dequant import GGML_NAME, row_bytes
@@ -69,6 +70,17 @@ def validate(model_path: str) -> None:
     config = parse_gguf_config(shim)
     config = replace(config, moe_backend="offload")
     types = _tensor_types_header_only(path)
+
+    # Standalone scripts do not pass through Engine's distributed bootstrap.
+    # The GGUF path is TP=1 only, so seed the same global information that
+    # VocabParallelEmbedding / parallel linear layers expect during construction.
+    tp = try_get_tp_info()
+    if tp is None:
+        set_tp_info(rank=0, size=1)
+    elif (tp.rank, tp.size) != (0, 1):
+        raise RuntimeError(
+            f"Qwen4Exp GGUF smoke validation requires TP=1, got rank={tp.rank} size={tp.size}"
+        )
 
     # Full model construction, but no storage allocation and no payload access.
     with torch.device("meta"):
