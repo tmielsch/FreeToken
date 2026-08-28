@@ -15,7 +15,7 @@ from .reader import gguf_architecture, load_gguf_metadata
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
 # laguna ships a plain gpt2-style BPE (tokenizer.ggml.model = "gpt2"); transformers
 # has no "laguna" converter, so route it to the gpt2 one.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "laguna": "gpt2"}
+_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "laguna": "gpt2", "qwen4exp": "qwen3"}
 
 
 def load_gguf_tokenizer(model_path: str):
