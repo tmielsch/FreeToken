@@ -23,8 +23,9 @@ to the GEMM because all parts read the same input: ``cat([x @ W1.T, x @ W2.T]) =
 
 1. **Unquantized (F32, F16, BF16)**: straight torch matmul ``x @ qweight.T``.
 2. **Small-batch quantized (batch <= 6, MMVQ types)**: GEMV kernel via ``ggml_mul_mat_vec_a8``.
-3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants)**: MMQ kernel
-   via ``ggml_mul_mat_a8``.
+3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, K-quants)**: MMQ kernel
+   via ``ggml_mul_mat_a8``. Q8_0 is excluded for now: its MMQ path produces NaNs, so it
+   takes the dequant route below.
 4. **Large-batch I-quants (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)**:
    I-quants have MMVQ and dequant kernels but NO MMQ kernel. Prefill therefore falls back to
    ``ggml_dequantize`` + plain torch matmul. This materializes a transient BF16 copy of the weight
@@ -45,6 +46,7 @@ from freetoken.models.gguf.dequant import (
     GGML_F16,
     GGML_F32,
     GGML_NAME,
+    GGML_Q8_0,
     GGML_UNQUANTIZED,
     MMQ_TYPES,
     MMVQ_TYPES,
@@ -102,7 +104,11 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return (x.to(w.dtype) @ w.T).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in MMQ_TYPES:
+    # Q8_0 is routed to the dequant path below instead of the MMQ kernel: the
+    # borrowed ggml_mul_mat_a8 Q8_0 path produces NaNs for large-batch forwards
+    # (e.g. during prefill), so until that kernel path is fixed, large-batch Q8_0
+    # weights fall back to ggml_dequantize + torch matmul.
+    if qweight_type in MMQ_TYPES and qweight_type != GGML_Q8_0:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:
         block, type_size = BLOCK_SHAPE[qweight_type]
