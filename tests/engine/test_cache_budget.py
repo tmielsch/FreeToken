@@ -382,6 +382,17 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
+def test_custom_factory_auto_resolves_to_num_experts_floor():
+    """Desktop-app start path: no sizing flags + model-owned cache factory (GGUF).
+    The engine must resolve the unresolved --moe-cache-auto default to the
+    num_experts slot floor instead of raising -- a GUI start cannot pass
+    --moe-cache-size."""
+    from freetoken.engine.engine import default_cache_size_for_custom_factory
+
+    config = SimpleNamespace(model_config=SimpleNamespace(num_experts=512))
+    assert default_cache_size_for_custom_factory(config) == 512
+
+
 def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 

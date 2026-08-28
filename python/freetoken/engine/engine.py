@@ -44,6 +44,15 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
         )
 
 
+def default_cache_size_for_custom_factory(config) -> int:
+    """Slot-count default when a model-owned ``make_offload_moe_cache`` meets an
+    unresolved ``--moe-cache-auto`` (e.g. the desktop app's no-sizing-flag start).
+    Auto sizing works on bytes against the engine-managed slot arena, but the
+    custom factory builds its own cache from ``moe_cache_size`` directly — so the
+    safe floor is exactly one slot per expert (``validate_rebuild``'s minimum)."""
+    return config.model_config.num_experts
+
+
 def _flashinfer_available() -> bool:
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -511,10 +520,19 @@ class Engine:
         # falls back to per-quant providers, and the engine wires the banks into cache.
         cache_factory = getattr(self.model, "make_offload_moe_cache", None)
         if cache_factory is not None and config.moe_cache_auto:
-            raise ValueError(
-                "--moe-cache-auto is not supported for models with a custom "
-                "make_offload_moe_cache; pass --moe-cache-size explicitly."
+            # Models that own cache construction (GGUF: heterogeneous expert rows
+            # + geometry decode pools) read moe_cache_size directly, so auto's
+            # VRAM-proportional sizing cannot run. Falling back to the hard floor
+            # of one slot per expert (the minimum validate_rebuild accepts) makes
+            # the no-sizing-flag default load instead of failing.
+            default_size = default_cache_size_for_custom_factory(config)
+            logger.info_rank0(
+                "--moe-cache-auto is unsupported with a model-owned offload cache; "
+                f"defaulting --moe-cache-size to the num_experts floor "
+                f"({default_size} slots)"
             )
+            object.__setattr__(config, "moe_cache_auto", False)
+            object.__setattr__(config, "moe_cache_size", default_size)
         # decode_target picks the bank layout + the per-decode mechanism:
         #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend hybrid);
         #   "cpu"    -> CPU executor for the cpu_layer_ids set (all layers under --moe-backend
