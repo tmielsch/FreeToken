@@ -75,13 +75,22 @@ def load_gguf_expert_sources(
     """
     import gguf
 
-    from freetoken.models.gguf.reader import gguf_split_paths
+    from freetoken.models.gguf.reader import gguf_config_source, gguf_split_paths
     from freetoken.moe.host_banks import HostBank, pin_banks
 
     _require_tp1()
+    if layer_sink is not None:
+        # Direct serving is the first milestone. Reject before allocating ~50 GB
+        # instead of silently retaining it when a converter expected streaming.
+        raise NotImplementedError("Qwen4Exp GGUF FTW streaming conversion is not wired yet")
+
     types = config.qwen4_args.gguf_expert_types
     if not types:
         raise ValueError("Qwen4Exp GGUF expert types were not recovered from the tensor table")
+
+    source = gguf_config_source(model_path)
+    if source is None:
+        raise ValueError(f"cannot resolve Qwen4Exp GGUF source from {model_path!r}")
 
     L = config.num_moe_layers
     E = config.num_experts
@@ -95,12 +104,12 @@ def load_gguf_expert_sources(
     }
     banks = {name: [bank.tensor for bank in per_layer] for name, per_layer in hb.items()}
 
-    gate_parts: dict[int, torch.Tensor] = {}
+    gate_up_parts: dict[int, dict[str, torch.Tensor]] = {}
     seen_gate: set[int] = set()
     seen_up: set[int] = set()
     seen_down: set[int] = set()
 
-    for path in gguf_split_paths(model_path):
+    for path in gguf_split_paths(source):
         reader = gguf.GGUFReader(path)
         for tensor in reader.tensors:
             name = tensor.name
@@ -116,6 +125,8 @@ def load_gguf_expert_sources(
             actual_type = int(tensor.tensor_type)
 
             if suffix == "ffn_down_exps.weight":
+                if layer in seen_down:
+                    raise ValueError(f"duplicate routed expert tensor {name}")
                 if actual_type != down_type:
                     raise ValueError(
                         f"{name}: header type changed from {GGML_NAME.get(down_type, down_type)} "
@@ -133,27 +144,28 @@ def load_gguf_expert_sources(
                     f"{GGML_NAME.get(gate_up_type, gate_up_type)} to "
                     f"{GGML_NAME.get(actual_type, actual_type)}"
                 )
+
             half = I * row_bytes(H, gate_up_type)
             src = _packed_tensor_bytes(tensor).reshape(E, half)
-            if suffix == "ffn_gate_exps.weight":
-                gate_parts[layer] = src
+            part_name = "gate" if suffix == "ffn_gate_exps.weight" else "up"
+            parts = gate_up_parts.setdefault(layer, {})
+            if part_name in parts:
+                raise ValueError(f"duplicate routed expert tensor {name}")
+            parts[part_name] = src
+            if part_name == "gate":
                 seen_gate.add(layer)
-            elif suffix == "ffn_up_exps.weight":
-                gate = gate_parts.pop(layer, None)
-                if gate is None:
-                    # Shard/tensor order is not a correctness contract. Keep the up
-                    # half temporarily if it arrives first by storing it with a tag.
-                    gate_parts[layer] = -src  # sentinel view; resolved below is impossible for uint8
-                    raise RuntimeError(
-                        f"{name}: up expert tensor appeared before gate; unsupported tensor order"
-                    )
-                dst = banks["gate_up"][layer]
-                dst[:, :half].copy_(gate)
-                dst[:, half : 2 * half].copy_(src)
+            else:
                 seen_up.add(layer)
 
-    if gate_parts:
-        raise RuntimeError(f"incomplete gate/up expert layers: {sorted(gate_parts)}")
+            if "gate" in parts and "up" in parts:
+                dst = banks["gate_up"][layer]
+                dst[:, :half].copy_(parts["gate"])
+                dst[:, half : 2 * half].copy_(parts["up"])
+                del gate_up_parts[layer]
+
+    if gate_up_parts:
+        details = {layer: sorted(parts) for layer, parts in gate_up_parts.items()}
+        raise RuntimeError(f"incomplete gate/up expert layers: {details}")
 
     want = set(range(L))
     missing_gate = sorted(want - seen_gate)
@@ -164,11 +176,6 @@ def load_gguf_expert_sources(
             "Qwen4Exp GGUF is missing routed expert tensors: "
             f"gate={missing_gate}, up={missing_up}, down={missing_down}"
         )
-
-    if layer_sink is not None:
-        # Conversion support can be added once direct serving is validated. A sink
-        # must not be silently ignored because that would retain ~50 GB of host banks.
-        raise NotImplementedError("Qwen4Exp GGUF FTW streaming conversion is not wired yet")
 
     if torch.cuda.is_available():
         pin_banks(hb)
