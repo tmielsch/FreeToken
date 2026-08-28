@@ -46,6 +46,81 @@ def _as_tuple(value) -> tuple[int, ...]:
         return (int(value),)
 
 
+def _tensor_types_header_only(model_path: str) -> dict[str, int]:
+    """Return ``{tensor_name: ggml_type}`` without touching tensor payload pages.
+
+    ``GGUFReader`` mmaps a file, but tensor names/types live in the tensor-info
+    section. In particular this must never call ``GgufTensor.packed()`` or turn
+    ``tensor.data`` into a contiguous NumPy array: Qwen3.8 carries a huge PLE
+    table and scanning its payload just to discover quant types would be fatal.
+    """
+    import gguf
+
+    from freetoken.models.gguf.reader import gguf_split_paths
+
+    types: dict[str, int] = {}
+    for path in gguf_split_paths(model_path):
+        reader = gguf.GGUFReader(path)
+        for tensor in reader.tensors:
+            if tensor.name in types:
+                raise ValueError(
+                    f"duplicate GGUF tensor {tensor.name!r} across split shards"
+                )
+            types[tensor.name] = int(tensor.tensor_type)
+    return types
+
+
+def _gguf_geometry(
+    model_path: str, num_layers: int
+) -> tuple[int | None, tuple[tuple[int, int], ...] | None]:
+    """Return embedding type and routed-expert ``(gate_up, down)`` types per layer.
+
+    Published Qwen4Exp GGUFs store routed gate and up as separate tensors. The
+    generic FreeToken GGUF expert bank fuses their packed rows, which is only
+    valid when both use the same ggml type for that layer; assert this rather
+    than silently corrupting a dynamic Unsloth checkpoint.
+    """
+    types = _tensor_types_header_only(model_path)
+    if not types:
+        # Metadata-only GGUF (e.g. a future FTW conversion) has no tensor table.
+        return None, None
+
+    embed_type = types.get("token_embd.weight")
+    expert_types: list[tuple[int, int]] = []
+    missing: list[str] = []
+    for layer in range(num_layers):
+        gate_name = f"blk.{layer}.ffn_gate_exps.weight"
+        up_name = f"blk.{layer}.ffn_up_exps.weight"
+        down_name = f"blk.{layer}.ffn_down_exps.weight"
+        gate = types.get(gate_name)
+        up = types.get(up_name)
+        down = types.get(down_name)
+        for name, value in ((gate_name, gate), (up_name, up), (down_name, down)):
+            if value is None:
+                missing.append(name)
+        if gate is None or up is None or down is None:
+            continue
+        if gate != up:
+            raise ValueError(
+                f"Qwen4Exp GGUF layer {layer} uses different routed gate/up types "
+                f"({gate} != {up}); the fused gate_up bank requires one type per layer"
+            )
+        expert_types.append((gate, down))
+
+    if missing:
+        raise ValueError(
+            "Qwen4Exp GGUF tensor table is missing routed expert tensors: "
+            + ", ".join(missing[:8])
+            + (" ..." if len(missing) > 8 else "")
+        )
+    if len(expert_types) != num_layers:
+        raise ValueError(
+            f"Qwen4Exp GGUF recovered {len(expert_types)} expert layers, "
+            f"expected {num_layers}"
+        )
+    return embed_type, tuple(expert_types)
+
+
 def _layer_groups(metadata: dict, num_layers: int) -> tuple[tuple[int, ...], tuple[int, ...], int]:
     """Return ``(linear_ids, qsa_ids, index_compress_ratio)``.
 
@@ -155,6 +230,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             m.get("tokenizer.ggml.eos_token_id", m.get("tokenizer.ggml.eot_token_id", 0))
         )
 
+    embed_quant, expert_types = _gguf_geometry(shim.model_path, num_layers)
     qwen4_args = Qwen4ExpArgs(
         hc_count=int(g("hyper_connection.count")),
         hc_lowrank=int(g("hyper_connection.low_rank")),
@@ -174,6 +250,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         output_gate_type="sigmoid",
         mrope_section=mrope_section,
         mrope_interleaved=True,
+        gguf_model_path=shim.model_path,
+        gguf_embed_quant=embed_quant,
+        gguf_expert_types=expert_types,
     )
 
     groups = (
@@ -240,10 +319,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
 
 def gguf_quant_inventory(model_path: str) -> dict[int, int]:
-    """Count tensors by native ggml type across all GGUF shards."""
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-
-    counts = Counter(t.ggml_type for t in iter_gguf_tensors(model_path))
+    """Count tensors by native ggml type from headers only."""
+    counts = Counter(_tensor_types_header_only(model_path).values())
     return dict(sorted(counts.items()))
 
 
