@@ -11,7 +11,6 @@ loader.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 
 from freetoken.models.gguf.dequant import GGML_NAME, row_bytes
@@ -57,10 +56,34 @@ def _geometry(config) -> list[tuple[int, int]]:
     ]
 
 
-def _packed_tensor_bytes(tensor) -> torch.Tensor:
-    """Materialize one selected GGUF tensor as a flat uint8 CPU tensor."""
-    raw = np.ascontiguousarray(tensor.data).reshape(-1).view(np.uint8)
-    return torch.from_numpy(raw)
+def _copy_expert_tensor(file, tensor, destination: torch.Tensor, payload: int) -> None:
+    """Read one GGUF expert tensor directly into its destination bank rows.
+
+    Accessing ``tensor.data`` faults the whole tensor's file mapping while the
+    destination bank is filled.  Direct row reads keep the transient source
+    buffer bounded to the file API's internal buffer instead.
+    """
+    if destination.ndim != 2 or destination.shape[1] < payload:
+        raise ValueError(
+            f"{tensor.name}: destination shape {tuple(destination.shape)} cannot hold "
+            f"{payload} bytes/expert"
+        )
+    expected = destination.shape[0] * payload
+    if int(tensor.n_bytes) != expected:
+        raise ValueError(
+            f"{tensor.name}: payload has {int(tensor.n_bytes)} bytes, expected {expected}"
+        )
+    offset = int(tensor.data_offset)
+    for expert in range(destination.shape[0]):
+        row = destination[expert, :payload]
+        if not row.is_contiguous():
+            raise RuntimeError(f"{tensor.name}: destination row is not contiguous")
+        file.seek(offset + expert * payload)
+        read = file.readinto(memoryview(row.numpy()))
+        if read != payload:
+            raise OSError(
+                f"{tensor.name}: short read for expert {expert}: {read} != {payload} bytes"
+            )
 
 
 def load_gguf_expert_sources(
@@ -104,68 +127,58 @@ def load_gguf_expert_sources(
     }
     banks = {name: [bank.tensor for bank in per_layer] for name, per_layer in hb.items()}
 
-    gate_up_parts: dict[int, dict[str, torch.Tensor]] = {}
     seen_gate: set[int] = set()
     seen_up: set[int] = set()
     seen_down: set[int] = set()
 
     for path in gguf_split_paths(source):
         reader = gguf.GGUFReader(path)
-        for tensor in reader.tensors:
-            name = tensor.name
-            if not name.startswith("blk.") or not name.endswith(_EXPERT_SUFFIXES):
-                continue
+        with open(path, "rb", buffering=0) as file:
+            for tensor in reader.tensors:
+                name = tensor.name
+                if not name.startswith("blk.") or not name.endswith(_EXPERT_SUFFIXES):
+                    continue
 
-            _, layer_text, suffix = name.split(".", 2)
-            layer = int(layer_text)
-            if not (0 <= layer < L):
-                raise ValueError(f"{name}: expert layer {layer} outside [0, {L})")
+                _, layer_text, suffix = name.split(".", 2)
+                layer = int(layer_text)
+                if not (0 <= layer < L):
+                    raise ValueError(f"{name}: expert layer {layer} outside [0, {L})")
 
-            gate_up_type, down_type = types[layer]
-            actual_type = int(tensor.tensor_type)
+                gate_up_type, down_type = types[layer]
+                actual_type = int(tensor.tensor_type)
 
-            if suffix == "ffn_down_exps.weight":
-                if layer in seen_down:
-                    raise ValueError(f"duplicate routed expert tensor {name}")
-                if actual_type != down_type:
+                if suffix == "ffn_down_exps.weight":
+                    if layer in seen_down:
+                        raise ValueError(f"duplicate routed expert tensor {name}")
+                    if actual_type != down_type:
+                        raise ValueError(
+                            f"{name}: header type changed from {GGML_NAME.get(down_type, down_type)} "
+                            f"to {GGML_NAME.get(actual_type, actual_type)}"
+                        )
+                    payload = H * row_bytes(I, down_type)
+                    _copy_expert_tensor(file, tensor, banks["down"][layer], payload)
+                    seen_down.add(layer)
+                    continue
+
+                if actual_type != gate_up_type:
                     raise ValueError(
-                        f"{name}: header type changed from {GGML_NAME.get(down_type, down_type)} "
-                        f"to {GGML_NAME.get(actual_type, actual_type)}"
+                        f"{name}: header type changed from "
+                        f"{GGML_NAME.get(gate_up_type, gate_up_type)} to "
+                        f"{GGML_NAME.get(actual_type, actual_type)}"
                     )
-                payload = H * row_bytes(I, down_type)
-                src = _packed_tensor_bytes(tensor).reshape(E, payload)
-                banks["down"][layer][:, :payload].copy_(src)
-                seen_down.add(layer)
-                continue
 
-            if actual_type != gate_up_type:
-                raise ValueError(
-                    f"{name}: header type changed from "
-                    f"{GGML_NAME.get(gate_up_type, gate_up_type)} to "
-                    f"{GGML_NAME.get(actual_type, actual_type)}"
-                )
-
-            half = I * row_bytes(H, gate_up_type)
-            src = _packed_tensor_bytes(tensor).reshape(E, half)
-            part_name = "gate" if suffix == "ffn_gate_exps.weight" else "up"
-            parts = gate_up_parts.setdefault(layer, {})
-            if part_name in parts:
-                raise ValueError(f"duplicate routed expert tensor {name}")
-            parts[part_name] = src
-            if part_name == "gate":
-                seen_gate.add(layer)
-            else:
-                seen_up.add(layer)
-
-            if "gate" in parts and "up" in parts:
                 dst = banks["gate_up"][layer]
-                dst[:, :half].copy_(parts["gate"])
-                dst[:, half : 2 * half].copy_(parts["up"])
-                del gate_up_parts[layer]
-
-    if gate_up_parts:
-        details = {layer: sorted(parts) for layer, parts in gate_up_parts.items()}
-        raise RuntimeError(f"incomplete gate/up expert layers: {details}")
+                half = I * row_bytes(H, gate_up_type)
+                if suffix == "ffn_gate_exps.weight":
+                    if layer in seen_gate:
+                        raise ValueError(f"duplicate routed expert tensor {name}")
+                    _copy_expert_tensor(file, tensor, dst[:, :half], half)
+                    seen_gate.add(layer)
+                else:
+                    if layer in seen_up:
+                        raise ValueError(f"duplicate routed expert tensor {name}")
+                    _copy_expert_tensor(file, tensor, dst[:, half : 2 * half], half)
+                    seen_up.add(layer)
 
     want = set(range(L))
     missing_gate = sorted(want - seen_gate)
