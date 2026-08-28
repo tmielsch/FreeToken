@@ -384,6 +384,13 @@ public:
   }
 
   template <typename... Ts>
+  auto with_dtype(SymbolicDType &dtype) && -> TensorMatcher && {
+    m_init_dtype();
+    m_dtype.rebind(dtype);
+    return std::move(*this);
+  }
+
+  template <typename... Ts>
   auto with_dtype(DTypeRef &&dtype) && -> TensorMatcher && {
     m_init_dtype();
     m_dtype.rebind(*dtype);
@@ -395,6 +402,13 @@ public:
   auto with_dtype() && -> TensorMatcher && {
     m_init_dtype();
     m_dtype->set_options<Ts...>();
+    return std::move(*this);
+  }
+
+  template <DLDeviceType... Codes>
+  auto with_device(SymbolicDevice &device) && -> TensorMatcher && {
+    m_init_device();
+    m_device.rebind(device);
     return std::move(*this);
   }
 
