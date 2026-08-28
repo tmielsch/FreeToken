@@ -64,9 +64,10 @@ def _patch_tvm_ffi_windows_cuda_flags() -> None:
         # files reference cudaLaunchKernel, __cudaRegisterFatBinary, etc.
         if "compile_cuda" in ninja and "cudart.lib" not in ninja:
             if cuda_lib_dir:
+                # Quote the path — MSVC link.exe splits on spaces.
                 ninja = ninja.replace(
                     "ldflags = ",
-                    f'ldflags = /LIBPATH:{cuda_lib_dir} cudart.lib ',
+                    f'ldflags = /LIBPATH:\"{cuda_lib_dir}\" cudart.lib ',
                 )
             else:
                 ninja = ninja.replace(
