@@ -56,7 +56,8 @@ def _vswhere_path() -> Path | None:
     return Path(found) if found else None
 
 
-def _vcvars64_path() -> Path | None:
+def _visual_studio_installation() -> Path | None:
+    """Find a VS install carrying the x64 C++ tools."""
     vswhere = _vswhere_path()
     if vswhere is not None:
         try:
@@ -73,12 +74,13 @@ def _vcvars64_path() -> Path | None:
                 ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 check=True,
             )
-            install = proc.stdout.strip().splitlines()
-            if install:
-                candidate = Path(install[-1]) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-                if candidate.is_file():
+            installs = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            if installs:
+                candidate = Path(installs[-1])
+                if candidate.is_dir():
                     return candidate
         except (OSError, subprocess.CalledProcessError):
             pass
@@ -92,10 +94,60 @@ def _vcvars64_path() -> Path | None:
     for root in roots:
         for year in ("2022", "2019"):
             for edition in editions:
-                candidate = root / year / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-                if candidate.is_file():
-                    return candidate
+                candidate = root / year / edition
+                if candidate.is_dir():
+                    vcvars = candidate / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                    if vcvars.is_file():
+                        return candidate
     return None
+
+
+def _msvc_env_scripts() -> list[tuple[Path, tuple[str, ...]]]:
+    install = _visual_studio_installation()
+    if install is None:
+        return []
+    scripts: list[tuple[Path, tuple[str, ...]]] = []
+    vsdevcmd = install / "Common7" / "Tools" / "VsDevCmd.bat"
+    if vsdevcmd.is_file():
+        scripts.append((vsdevcmd, ("-arch=amd64", "-host_arch=amd64")))
+    vcvars = install / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    if vcvars.is_file():
+        scripts.append((vcvars, ()))
+    return scripts
+
+
+def _capture_batch_environment(script: Path, args: tuple[str, ...]) -> tuple[dict[str, str] | None, str]:
+    """Run a VS environment batch file and capture the resulting environment."""
+    arg_text = " ".join(args)
+    invoke = f'call "{script}"{(" " + arg_text) if arg_text else ""} && set'
+    try:
+        proc = subprocess.run(
+            ["cmd.exe", "/d", "/c", invoke],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        return None, f"could not start cmd.exe: {exc}"
+
+    diagnostic = "\n".join(
+        part.strip()
+        for part in (proc.stdout, proc.stderr)
+        if part and part.strip()
+    )
+    if proc.returncode != 0:
+        return None, diagnostic or f"batch exited with code {proc.returncode}"
+
+    env: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if not line or line.startswith("=") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key] = value
+    if not env:
+        return None, diagnostic or "batch succeeded but produced no environment"
+    return env, diagnostic
 
 
 @functools.cache
@@ -104,38 +156,34 @@ def ensure_windows_msvc_env() -> None:
     if os.name != "nt" or shutil.which("cl"):
         return
 
-    vcvars = _vcvars64_path()
-    if vcvars is None:
+    scripts = _msvc_env_scripts()
+    if not scripts:
         raise RuntimeError(
-            "MSVC cl.exe is not on PATH and Visual Studio vcvars64.bat could not be found. "
-            "Install the Visual Studio C++ build tools (x64) or run FreeToken from an "
-            "x64 Native Tools Command Prompt."
+            "MSVC cl.exe is not on PATH and no Visual Studio x64 developer environment "
+            "could be found. Install the Visual Studio C++ build tools (x64)."
         )
 
-    try:
-        proc = subprocess.run(
-            ["cmd.exe", "/d", "/c", f'call "{vcvars}" >nul && set'],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"failed to initialize MSVC environment via {vcvars}") from exc
-
-    for line in proc.stdout.splitlines():
-        if not line or line.startswith("=") or "=" not in line:
+    failures: list[str] = []
+    for script, args in scripts:
+        env, diagnostic = _capture_batch_environment(script, args)
+        if env is None:
+            failures.append(f"{script}:\n{diagnostic}")
             continue
-        key, value = line.split("=", 1)
-        os.environ[key] = value
 
-    os.environ["DISTUTILS_USE_SDK"] = "1"
-    os.environ["MSSdk"] = "1"
-
-    if shutil.which("cl") is None:
-        raise RuntimeError(
-            f"initialized {vcvars}, but cl.exe is still not discoverable on PATH"
+        os.environ.update(env)
+        os.environ["DISTUTILS_USE_SDK"] = "1"
+        os.environ["MSSdk"] = "1"
+        if shutil.which("cl") is not None:
+            return
+        failures.append(
+            f"{script}: environment loaded, but cl.exe is still not discoverable on PATH"
         )
+
+    detail = "\n\n".join(failures)
+    raise RuntimeError(
+        "failed to initialize an x64 MSVC environment for the FreeToken JIT kernels.\n"
+        + detail
+    )
 
 
 @functools.cache
