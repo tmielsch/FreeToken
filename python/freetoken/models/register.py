@@ -71,6 +71,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen4_exp",
         "Qwen4ExpForCausalLM",
     ),
+    # Native llama.cpp/Unsloth GGUF for Qwen3.8-Flash-Next. The model class is
+    # shared, while config and weight loading come from the qwen4_exp GGUF adapter.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
     # with a [SWA x3, full] pattern -- full layers are NoPE -- weightless qk norms, centered
