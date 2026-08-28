@@ -70,15 +70,7 @@ def gguf_split_paths(model_path: str) -> tuple[str, ...]:
     return paths
 
 
-# Canonical name of the metadata-only GGUF that ``convert_checkpoint`` drops into an FTW
-# dir built from a bare ``.gguf`` source. A GGUF carries its config AND tokenizer in the
-# file's KV section, not sibling files, so a converted checkpoint has nowhere else to read
-# them from -- this file is the header + KV bytes verbatim (tensor_count patched to 0, no
-# tensor infos, no weight data), letting the FTW dir resolve config/tokenizer the exact
-# same way as the original ``.gguf`` file does.
 FTW_METADATA_GGUF = "source_metadata.gguf"
-# Records whether the source carried an untied ``output.weight`` head (the tensor table
-# is stripped from metadata-only gguf files, so the fact travels as a KV).
 OUTPUT_WEIGHT_PRESENT_KV = "freetoken.output_weight_present"
 
 
@@ -92,8 +84,6 @@ def _gguf_in_directory(model_path: str) -> str | None:
     if not files:
         return None
 
-    # A split family is represented by its first shard. Multiple quant families in
-    # one directory are ambiguous and must be selected explicitly by file path.
     first_shards = []
     singles = []
     for path in files:
@@ -105,7 +95,6 @@ def _gguf_in_directory(model_path: str) -> str | None:
 
     candidates = singles + first_shards
     if len(candidates) == 1:
-        # Validate the sibling set now so every downstream consumer sees the same failure.
         return gguf_split_paths(candidates[0])[0]
     if len(candidates) > 1:
         raise ValueError(
@@ -117,12 +106,7 @@ def _gguf_in_directory(model_path: str) -> str | None:
 
 
 def gguf_config_source(model_path: str) -> str | None:
-    """The GGUF file to source config/tokenizer/metadata from, or ``None``.
-
-    A split GGUF resolves to shard 1. A local directory containing exactly one
-    GGUF family resolves to that family, which is convenient for Unsloth's
-    multi-shard downloads. FTW directories keep using ``source_metadata.gguf``.
-    """
+    """The GGUF file to source config/tokenizer/metadata from, or ``None``."""
     if is_gguf_path(model_path):
         return gguf_split_paths(model_path)[0]
     if isinstance(model_path, str) and os.path.isdir(model_path):
@@ -142,10 +126,9 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     assert reader.tensors, f"{source_gguf}: no tensors to bound the KV section"
     kv_end = int(reader.tensors[0].field.offset)
     buf = bytearray(reader.data[:kv_end].tobytes())
-    buf[8:16] = b"\x00" * 8  # tensor_count
+    buf[8:16] = b"\x00" * 8
     key = OUTPUT_WEIGHT_PRESENT_KV.encode()
 
-    # For split GGUFs the untied output tensor may live in another shard.
     present = "output.weight" in gguf_tensor_names(source_gguf)
     buf += struct.pack("<Q", len(key)) + key
     buf += struct.pack("<I", int(gguf.GGUFValueType.BOOL)) + bytes([1 if present else 0])
@@ -169,7 +152,7 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
 @dataclass(frozen=True)
 class GgufTensor:
     name: str
-    shape: tuple[int, ...]  # torch order (ggml dims reversed)
+    shape: tuple[int, ...]
     ggml_type: int
     rows: int
     row_bytes: int
@@ -236,21 +219,35 @@ def _iter_file_tensors(path: str) -> Iterator[GgufTensor]:
 
 
 def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield tensors across all shards of a single/split GGUF model."""
+    """Yield tensor payload views across all shards of a single/split GGUF model.
+
+    This API may touch tensor payload pages. Header-only callers should use
+    :func:`gguf_tensor_names` or inspect ``_reader(path).tensors`` directly.
+    """
     paths = gguf_split_paths(model_path)
     seen: set[str] = set()
     for path in paths:
         for tensor in _iter_file_tensors(path):
             if tensor.name in seen:
-                raise ValueError(
-                    f"duplicate GGUF tensor {tensor.name!r} across split shards"
-                )
+                raise ValueError(f"duplicate GGUF tensor {tensor.name!r} across split shards")
             seen.add(tensor.name)
             yield tensor
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in iter_gguf_tensors(model_path)}
+    """Header-only tensor-name inventory across a split GGUF family.
+
+    Do not route this through :func:`iter_gguf_tensors`: Unsloth Qwen3.8 files are
+    ~90 GB and include a very large PLE table, while names live entirely in the
+    tiny tensor-info headers.
+    """
+    names: set[str] = set()
+    for path in gguf_split_paths(model_path):
+        for tensor in _reader(path).tensors:
+            if tensor.name in names:
+                raise ValueError(f"duplicate GGUF tensor {tensor.name!r} across split shards")
+            names.add(tensor.name)
+    return names
 
 
 __all__ = [
