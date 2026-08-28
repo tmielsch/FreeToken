@@ -269,8 +269,8 @@ inline auto get_sync_flag_ptr(
 ) -> int32_t* {
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
-        .with_dtype<int32_t>(host::DTypeRef(flag_dtype))
-        .with_device<kDLCUDA>(host::DeviceRef(device))
+        .with_dtype<int32_t>(host::details::DTypeRef(flag_dtype))
+        .with_device<kDLCUDA>(host::details::DeviceRef(device))
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
