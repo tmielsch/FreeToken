@@ -335,6 +335,7 @@ struct SizeRef : BaseRef<SymbolicSize> {
 
 struct DTypeRef : BaseRef<SymbolicDType> {
   using BaseRef::BaseRef;
+  DTypeRef(SymbolicDType &dtype) : BaseRef(dtype) {}
   DTypeRef(DLDataType options) { (**this).set_value(options); }
   DTypeRef(std::initializer_list<DLDataType> options) {
     (**this).set_options(options);
@@ -346,6 +347,7 @@ struct DTypeRef : BaseRef<SymbolicDType> {
 
 struct DeviceRef : BaseRef<SymbolicDevice> {
   using BaseRef::BaseRef;
+  DeviceRef(SymbolicDevice &device) : BaseRef(device) {}
   DeviceRef(DLDevice options) { (**this).set_value(options); }
   DeviceRef(std::initializer_list<DLDevice> options) {
     (**this).set_options(options);
