@@ -1,5 +1,6 @@
 from .config import parse_config
 from .gguf import gguf_quant_inventory, parse_gguf_config
+from .gguf_runtime import Qwen4ExpGGUFForCausalLM
 from .gguf_weights import iter_gguf_weights_impl as iter_gguf_weights
 from .model import Qwen4ExpForCausalLM
 from .weight import (
@@ -12,6 +13,7 @@ from .weight import (
 
 __all__ = [
     "Qwen4ExpForCausalLM",
+    "Qwen4ExpGGUFForCausalLM",
     "iter_weights",
     "iter_weights_parallel",
     "load_nvfp4_expert_sources",
