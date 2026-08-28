@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 from setuptools import setup
@@ -25,10 +26,38 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
             "because it links against the CUDA runtime API."
         )
     cuda_home = Path(CUDA_HOME)
-    library_dirs = [str(cuda_home / "lib64")]
-    if (cuda_home / "lib").exists():
-        library_dirs.append(str(cuda_home / "lib"))
+
+    # CUDA's library layout differs by platform. Linux toolkits conventionally
+    # expose lib64/, while the Windows toolkit installs cudart.lib in lib/x64/.
+    # Keep lib/ as a final compatibility fallback for non-standard layouts.
+    candidates = [
+        cuda_home / "lib64",
+        cuda_home / "lib" / "x64",
+        cuda_home / "lib",
+    ]
+    library_dirs = [str(path) for path in candidates if path.exists()]
+    if not library_dirs:
+        raise RuntimeError(
+            f"CUDA runtime library directory not found under {cuda_home}; "
+            "expected one of lib64, lib/x64, or lib"
+        )
     return [str(cuda_home / "include")], library_dirs
+
+
+def _cxx_args(*, cpu_moe: bool = False) -> list[str]:
+    """Compiler flags for setuptools' active native compiler.
+
+    PyTorch's CppExtension does not translate GCC flags for MSVC. Passing -O3,
+    -std=c++17, and -pthread through cl.exe merely produces D9002 warnings and
+    makes Windows builds unnecessarily fragile. Use native MSVC spellings there;
+    the CPU MoE extension does not need a separate pthread flag on Windows.
+    """
+    if os.name == "nt":
+        return ["/O2", "/std:c++17"]
+    args = ["-O3", "-std=c++17"]
+    if cpu_moe:
+        args.append("-pthread")
+    return args
 
 
 cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
@@ -45,7 +74,7 @@ setup(
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17"],
+            extra_compile_args=_cxx_args(),
         ),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
@@ -60,7 +89,7 @@ setup(
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+            extra_compile_args=_cxx_args(cpu_moe=True),
         ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
