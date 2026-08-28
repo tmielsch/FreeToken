@@ -35,6 +35,16 @@ def _patch_tvm_ffi_windows_cuda_flags() -> None:
 
     if getattr(extension, "_freetoken_windows_cuda_flags_patch", False):
         return
+
+    # Resolve CUDA lib path for the linker fix.
+    cuda_lib_dir = ""
+    try:
+        cuda_home = extension._find_cuda_home()
+        if cuda_home:
+            cuda_lib_dir = str(pathlib.Path(cuda_home) / "lib" / "x64")
+    except Exception:
+        pass
+
     generate = extension._generate_ninja_build
 
     @functools.wraps(generate)
@@ -49,9 +59,20 @@ def _patch_tvm_ffi_windows_cuda_flags() -> None:
             "-Xcompiler /std:c++17",
             "-Xcompiler /std:c++20",
         )
-        # Keep the non-CUDA C++ path on C++20 as well; the alias is harmless
-        # on the already-correct FreeToken C++ build but fixes tvm-ffi's default.
         ninja = ninja.replace("/std:c++17", "/std:c++20")
+        # tvm-ffi omits cudart.lib from the Windows link line. CUDA object
+        # files reference cudaLaunchKernel, __cudaRegisterFatBinary, etc.
+        if "compile_cuda" in ninja and "cudart.lib" not in ninja:
+            if cuda_lib_dir:
+                ninja = ninja.replace(
+                    "ldflags = ",
+                    f'ldflags = /LIBPATH:{cuda_lib_dir} cudart.lib ',
+                )
+            else:
+                ninja = ninja.replace(
+                    "ldflags = ",
+                    "ldflags = cudart.lib ",
+                )
         return ninja
 
     extension._generate_ninja_build = generate_ninja_build
