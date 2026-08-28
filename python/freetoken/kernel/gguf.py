@@ -19,21 +19,24 @@ import shutil
 
 import torch
 
+from ._toolchain import check_nvcc_matches_torch, ensure_windows_msvc_env
+
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
 
 
 def _host_compiler() -> str | None:
     """A host compiler nvcc + libtorch headers accept.
 
-    The system default gcc can be too new for the torch headers (gcc 16 hard-errors),
-    and on this toolchain even nvcc+gcc-13 trips a non-conformant ``typename
-    decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
-    with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
-    to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+    Linux prefers clang++ and then older GCC versions because very new system GCC
+    versions can reject torch headers. Windows deliberately uses the MSVC toolchain
+    initialized by ``ensure_windows_msvc_env``; an explicit override remains available
+    through ``FREETOKEN_GGUF_HOST_CXX``.
     """
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override
+    if os.name == "nt":
+        return None
     for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
         if shutil.which(cxx):
             return cxx
@@ -47,9 +50,16 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
+
+    # A normal PowerShell/cmd session does not inherit Visual Studio's developer
+    # environment. PyTorch's JIT path requires cl.exe plus INCLUDE/LIB on Windows,
+    # so bootstrap vcvars64 before it asks Ninja to compile anything.
+    ensure_windows_msvc_env()
+    check_nvcc_matches_torch()
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
     host_cxx = _host_compiler()
