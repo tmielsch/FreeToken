@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -348,11 +349,16 @@ class OffloadMoeCache:
         dst = destination.reshape(destination.shape[0], -1)
         src = source.reshape(source.shape[0], -1)
         if registered_host and dst.is_cuda and dst.shape[1] != src.shape[1]:
-            from freetoken.kernel.fast_index_copy import (
-                fast_index_copy_rows_strided_jit,
-            )
+            if sys.platform != "win32":
+                from freetoken.kernel.fast_index_copy import (
+                    fast_index_copy_rows_strided_jit,
+                )
 
-            fast_index_copy_rows_strided_jit(dst, src)
+                fast_index_copy_rows_strided_jit(dst, src)
+                return
+            # Windows: tvm_ffi JIT kernel has an MSVC TensorMatcher overload
+            # issue. Fall back to the equivalent strided copy_ for correctness.
+            dst[:, : src.shape[1]].copy_(src, non_blocking=True)
             return
         dst[:, : src.shape[1]].copy_(src, non_blocking=True)
 
