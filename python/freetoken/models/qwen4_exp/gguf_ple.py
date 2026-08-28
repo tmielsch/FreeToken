@@ -9,6 +9,8 @@ by the current token batch, and dequantizes those tiny row batches on the GPU.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -194,12 +196,40 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
             )
         if self._packed_rows is None or self._host_constants is None:
             raise RuntimeError("Qwen4Exp GGUF PLE host weights are not loaded")
+        if os.path.exists(r"D:\temp\opencode\ft_zero_ple.flag"):
+            from freetoken.core import get_global_ctx
+            return torch.zeros(
+                get_global_ctx().batch.input_ids.numel(),
+                self.embedding_dim, device=device, dtype=dtype,
+            )
 
         ids = self._current_ngram_ids().reshape(-1)
         if ids.numel() == 0:
             return torch.empty(
                 0, self.embedding_dim, device=device, dtype=dtype
             )
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                from freetoken.core import get_global_ctx
+                from freetoken.utils.logger import init_logger
+                _log = init_logger("freetoken.qwen4exp.ple")
+                _batch = get_global_ctx().batch
+                _reqs = _batch.padded_reqs if _batch.is_decode else getattr(_batch, "reqs", None) or _batch.padded_reqs
+                _tok_tail = []
+                _req_tail = []
+                for r in (_reqs or []):
+                    _ids_t = r.input_ids
+                    _tok_tail.append(_ids_t[-3:].tolist() if _ids_t.numel() else [])
+                    _req_tail.append((r.uid, r.cached_len, r.device_len))
+                _nids = ids.numel()
+                _head_ids = ids[-3:].tolist() if _nids else []
+                _span = (int(ids.min()), int(ids.max()))
+                _log.info(
+                    "GGUF_PLE layer=%d n=%d ngram_ids_tail=%s tok_ids_tail=%s span=%s reqs=%s",
+                    self.layer_id, _nids, _head_ids, str(_tok_tail), _span, str(_req_tail),
+                )
+            except Exception:  # pragma: no cover
+                pass
         lo, hi = int(ids.min()), int(ids.max())
         if lo < 0 or hi >= self._row_count:
             raise IndexError(
@@ -236,6 +266,18 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
                 self.head_dim,
                 dtype,
             )
+
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                tail = values[-3:].float() if values.shape[0] >= 3 else values.float()
+                from freetoken.utils.logger import init_logger
+                _log = init_logger("freetoken.qwen4exp.ple")
+                _log.info(
+                    "GGUF_PLEV layer=%d tail_norms=%s",
+                    self.layer_id, [round(float(x), 4) for x in tail.norm(dim=-1).tolist()],
+                )
+            except Exception:  # pragma: no cover
+                pass
 
         return values.reshape(-1, self.embedding_dim)
 

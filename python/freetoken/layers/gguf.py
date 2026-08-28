@@ -23,9 +23,8 @@ to the GEMM because all parts read the same input: ``cat([x @ W1.T, x @ W2.T]) =
 
 1. **Unquantized (F32, F16, BF16)**: straight torch matmul ``x @ qweight.T``.
 2. **Small-batch quantized (batch <= 6, MMVQ types)**: GEMV kernel via ``ggml_mul_mat_vec_a8``.
-3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, K-quants)**: MMQ kernel
-   via ``ggml_mul_mat_a8``. Q8_0 is excluded for now: its MMQ path produces NaNs, so it
-   takes the dequant route below.
+3. **Large-batch standard quants (MMQ types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, K-quants)**: MMQ kernel
+   via ``ggml_mul_mat_a8``.
 4. **Large-batch I-quants (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)**:
    I-quants have MMVQ and dequant kernels but NO MMQ kernel. Prefill therefore falls back to
    ``ggml_dequantize`` + plain torch matmul. This materializes a transient BF16 copy of the weight
@@ -36,6 +35,8 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -104,11 +105,11 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return (x.to(w.dtype) @ w.T).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    # Q8_0 is routed to the dequant path below instead of the MMQ kernel: the
-    # borrowed ggml_mul_mat_a8 Q8_0 path produces NaNs for large-batch forwards
-    # (e.g. during prefill), so until that kernel path is fixed, large-batch Q8_0
-    # weights fall back to ggml_dequantize + torch matmul.
-    if qweight_type in MMQ_TYPES and qweight_type != GGML_Q8_0:
+    force_dequant_q8 = (
+        qweight_type == GGML_Q8_0
+        and os.path.exists(r"D:\temp\opencode\ft_nommq_q8.flag")
+    )
+    if qweight_type in MMQ_TYPES and not force_dequant_q8:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:
         block, type_size = BLOCK_SHAPE[qweight_type]
@@ -136,6 +137,51 @@ class GGUFLinear(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                f = out.float()
+                if bool((torch.isnan(f) | torch.isinf(f)).any()):
+                    nq = self.qweight
+                    s32 = nq.view(torch.int32).sum().item()
+                    first = getattr(self, "_dbg_wsum", None)
+                    if first is None:
+                        self._dbg_wsum = s32
+                    report = {
+                        "op_id": id(self),
+                        "qt": self._quant_type,
+                        "w_shape": tuple(nq.shape),
+                        "w_sum_now": s32,
+                        "w_sum_first": self._dbg_wsum,
+                        "changed": first is not None and s32 != first,
+                        "x_shape": tuple(x.shape),
+                        "x_maxabs": float(x.float().abs().max()),
+                    }
+                    from freetoken.utils import init_logger
+
+                    lg = init_logger("freetoken.qwen4exp.layerdbg")
+                    if self._quant_type in DEQUANT_TYPES:
+                        block, type_size = BLOCK_SHAPE[self._quant_type]
+                        in_features = nq.shape[1] // type_size * block
+                        from freetoken.kernel.gguf import ggml_dequantize
+
+                        wf = ggml_dequantize(
+                            nq, self._quant_type, nq.shape[0], in_features, x.dtype
+                        )
+                        ref = x[:, : in_features] @ wf.T
+                        rf = ref.float()
+                        report["ref_nan"] = bool((torch.isnan(rf) | torch.isinf(rf)).any())
+                        report["ref_maxabs"] = (
+                            float(rf.abs().max()) if not report["ref_nan"] else float("nan")
+                        )
+                        report["w_dequant_nan"] = bool(
+                            (torch.isnan(wf.float()) | torch.isinf(wf.float())).any()
+                        )
+                    lg.warning(
+                        "GQANOM %s",
+                        " ".join(f"{k}={v}" for k, v in report.items()),
+                    )
+            except Exception:
+                pass
         if self.bias is not None:
             out = out + self.bias
         return out

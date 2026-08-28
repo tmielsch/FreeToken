@@ -35,6 +35,29 @@ if TYPE_CHECKING:
     from .args import Qwen4ExpArgs
 
 
+def _layerdbg(tag: str, layer_id: int, t: torch.Tensor) -> None:
+    if not os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+        return
+    try:
+        f = t.float()
+        mx = float(f.norm(dim=-1).max())
+        bad = torch.isinf(f) | torch.isnan(f)
+        if bool(bad.any()):
+            bad_rows = bad.any(dim=-1)
+            rows = int(bad_rows.sum())
+            first = int(bad_rows.nonzero()[0].min()) if rows else -1
+            from freetoken.utils import init_logger
+
+            logger = init_logger("freetoken.qwen4exp.layerdbg")
+            logger.warning(
+                "LAYERDBG layer=%s tag=%s maxnorm=%.4g inf=%s nan=%s poisoned_rows=%s first_bad_row=%s",
+                layer_id, tag, mx, bool(torch.isinf(f).any()), bool(torch.isnan(f).any()),
+                rows, first,
+            )
+    except Exception:
+        pass
+
+
 class _Qwen4MRoPE(StateLessOP):
     """Partial, interleaved temporal/height/width RoPE for Qwen4-Exp."""
 
@@ -183,6 +206,7 @@ class _GatedRMSNorm(BaseOP):
 class _GatedResidual(BaseOP):
     def __init__(self, config: ModelConfig, combine: bool = True):
         args: Qwen4ExpArgs = config.qwen4_args
+        self._dbg_name = "hc"
         self.hc_count = args.hc_count
         self.hidden_size = config.hidden_size
         hc_size = self.hc_count * self.hidden_size
@@ -194,14 +218,84 @@ class _GatedResidual(BaseOP):
         )
 
     def forward(self, hyper_input: torch.Tensor):
+        _layerdbg(f"{self._dbg_name}.in", -1, hyper_input)
         normalized = self.hc_norm.forward(hyper_input)
-        mix = F.silu(self.input_mix_weight_down.forward(normalized) / self.hc_count)
-        mix = torch.sigmoid(self.input_mix_weight_up.forward(mix))
+        _layerdbg(f"{self._dbg_name}.norm", -1, normalized)
+        down_out = self.input_mix_weight_down.forward(normalized)
+        _layerdbg(f"{self._dbg_name}.down", -1, down_out)
+        mix = F.silu(down_out / self.hc_count)
+        up_out = self.input_mix_weight_up.forward(mix)
+        _layerdbg(f"{self._dbg_name}.up", -1, up_out)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag") and self._dbg_name == "L8attnHC":
+            try:
+                from freetoken.utils import init_logger
+
+                lg = init_logger("freetoken.qwen4exp.layerdbg")
+                mm = mix.float()
+                dd = down_out.float()
+                nn = normalized.float()
+                hh = hyper_input.float()
+                lg.warning(
+                    "L8UPSUMM in_max=%.4g norm_max=%.4g down_max=%.4g mix_max=%.4g mix_contig=%s mix_shape=%s up_max=%.4g",
+                    float(hh.abs().max()), float(nn.abs().max()), float(dd.abs().max()),
+                    float(mm.abs().max()), mix.is_contiguous(), tuple(mix.shape),
+                    float(up_out.float().abs().max()),
+                )
+            except Exception:
+                pass
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                uf = up_out.float()
+                if bool((torch.isnan(uf) | torch.isinf(uf)).any()):
+                    from freetoken.utils import init_logger
+
+                    lg = init_logger("freetoken.qwen4exp.layerdbg")
+                    for wn, wobj in (
+                        ("mix_dn", self.input_mix_weight_down),
+                        ("mix_up", self.input_mix_weight_up),
+                    ):
+                        w = getattr(wobj, "qweight", None)
+                        if w is None:
+                            continue
+                        wf = w.float()
+                        lg.warning(
+                            "HCQWEIGHT %s name=%s id=%d shape=%s ptr=%d maxabs=%.4g nan=%s inf=%s x_ptr=%d down_ptr=%d up_ptr=%d",
+                            self._dbg_name, wn, id(wobj), tuple(w.shape), w.data_ptr(),
+                            float(wf.abs().max()), bool(torch.isnan(wf).any()),
+                            bool(torch.isinf(wf).any()), hyper_input.data_ptr(),
+                            down_out.data_ptr(), up_out.data_ptr(),
+                        )
+            except Exception:
+                pass
+        mix = torch.sigmoid(up_out)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag") and (
+            bool(torch.isnan(mix.float()).any()) or bool(torch.isinf(mix.float()).any())
+        ):
+            try:
+                from freetoken.utils import init_logger
+
+                lg = init_logger("freetoken.qwen4exp.layerdbg")
+                for wn, w in (
+                    ("dn", self.input_mix_weight_down.weight),
+                    ("up", self.input_mix_weight_up.weight),
+                    ("hc", self.hc_norm.weight),
+                ):
+                    wf = w.float()
+                    lg.warning(
+                        "HCWEIGHT %s shape=%s ptr=%d maxabs=%.4g nan=%s inf=%s in_ptr=%d norm_ptr=%d down_ptr=%d",
+                        wn, tuple(w.shape), w.data_ptr(), float(wf.abs().max()),
+                        bool(torch.isnan(wf).any()), bool(torch.isinf(wf).any()),
+                        hyper_input.data_ptr(), normalized.data_ptr(), down_out.data_ptr(),
+                    )
+            except Exception:
+                pass
         mix = mix.view(-1, self.hc_count, self.hidden_size)
         mixed = (mix * normalized.view(-1, self.hc_count, self.hidden_size)).mean(dim=1)
+        _layerdbg(f"{self._dbg_name}.mixed", -1, mixed)
         if self.block_inject_weight is None:
             return mixed
         inject = 2 * torch.sigmoid(self.block_inject_weight.forward(normalized) / self.hc_count)
+        _layerdbg(f"{self._dbg_name}.inject", -1, inject)
         return mixed, hyper_input, inject
 
 
@@ -424,6 +518,23 @@ class _HostNGramEmbedding(BaseOP):
             token_count = get_global_ctx().batch.input_ids.numel()
             return torch.zeros(token_count, self.embedding_dim, device=device, dtype=dtype)
         ngram_ids = self._current_ngram_ids().reshape(-1)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                import logging as _logging
+                from freetoken.utils.logger import init_logger
+                _log = init_logger("freetoken.qwen4exp.ple")
+                _dev = "cpu"
+                _n = ngram_ids.numel()
+                _last = ngram_ids[-1].tolist() if _n else -1
+                _batch = get_global_ctx().batch
+                _reqs = _batch.padded_reqs if _batch.is_decode else _batch.reqs
+                _tail = [(r.uid, r.cached_len, r.device_len) for r in _reqs]
+                _log.info(
+                    "PLE layer=%d rows=%d last_ngram=%d reqs=%s",
+                    self.layer_id, _n, _last, str(_tail),
+                )
+            except Exception:  # pragma: no cover
+                pass
         shard_ids = torch.bucketize(ngram_ids, self._shard_ends, right=True)
         output = torch.empty(
             ngram_ids.numel(),
@@ -439,6 +550,18 @@ class _HostNGramEmbedding(BaseOP):
             output.index_copy_(0, positions, rows)
         fp8 = output.to(device=device, non_blocking=True).view(torch.float8_e4m3fn)
         embedded = fp8.to(dtype) * self._scale.to(device=device, dtype=dtype)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                from freetoken.utils.logger import init_logger
+                _log = init_logger("freetoken.qwen4exp.ple")
+                _tail_rows = embedded[-3:].float() if embedded.shape[0] >= 3 else embedded.float()
+                _norms = _tail_rows.norm(dim=-1).tolist()
+                _log.info(
+                    "PLE emb layer=%d n=%d last3_norms=%s",
+                    self.layer_id, embedded.shape[0], [round(x, 4) for x in _norms],
+                )
+            except Exception:  # pragma: no cover
+                pass
         return embedded.view(-1, self.embedding_dim)
 
 
@@ -582,7 +705,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if rope_positions is None:
             rope_positions = ctx.batch.positions
         q, k, v, gate = self._project(x, rope_positions)
+        _layerdbg("q", self.layer_id, q)
+        _layerdbg("k", self.layer_id, k)
+        _layerdbg("v", self.layer_id, v)
+        _layerdbg("gate_pre", self.layer_id, gate)
         index_q, index_k = self.indexer.project(x, rope_positions)
+        _layerdbg("index_q", self.layer_id, index_q)
+        _layerdbg("index_k", self.layer_id, index_k)
         output = ctx.attn_backend.qsa_forward(
             q,
             k,
@@ -593,6 +722,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             self.layer_id,
             ctx.batch,
         )
+        _layerdbg("qsa_out", self.layer_id, output)
         return self._combine(output, gate)
 
 
@@ -630,22 +760,31 @@ class Qwen4ExpDecoderLayer(BaseOP):
             else None
         )
         self.attn_hyper_connection = _GatedResidual(config)
+        self.attn_hyper_connection._dbg_name = f"L{layer_id}attnHC"
         self.mlp_hyper_connection = _GatedResidual(config)
+        self.mlp_hyper_connection._dbg_name = f"L{layer_id}mlpHC"
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        _layerdbg("in", self._layer_id, hidden)
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden)
+        _layerdbg("post_ple", self._layer_id, hidden)
         mixed, residual, weights = self.attn_hyper_connection.forward(hidden)
+        _layerdbg("attn_hc_out", self._layer_id, mixed)
         mixed = (
             self.linear_attn.forward(mixed)
             if self._is_linear
             else self.self_attn.forward(mixed)
         )
         hidden = residual + (mixed.unsqueeze(1) * weights.unsqueeze(-1)).flatten(1)
+        _layerdbg("post_attn", self._layer_id, hidden)
         mixed, residual, weights = self.mlp_hyper_connection.forward(hidden)
+        _layerdbg("mlp_hc_out", self._layer_id, mixed)
         mixed = self.mlp.forward(mixed)
-        return residual + (mixed.unsqueeze(1) * weights.unsqueeze(-1)).flatten(1)
+        hidden = residual + (mixed.unsqueeze(1) * weights.unsqueeze(-1)).flatten(1)
+        _layerdbg("post_mlp", self._layer_id, hidden)
+        return hidden
 
 
 class Qwen4ExpModel(BaseOP):
@@ -655,6 +794,7 @@ class Qwen4ExpModel(BaseOP):
             [Qwen4ExpDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
         self.hyper_connection_mixer = _GatedResidual(config, combine=False)
+        self.hyper_connection_mixer._dbg_name = "MIXER"
         self.hc_count = config.qwen4_args.hc_count
         self._image_token_id = config.image_token_id
 

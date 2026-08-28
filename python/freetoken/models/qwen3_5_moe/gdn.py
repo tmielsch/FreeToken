@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
@@ -11,6 +13,27 @@ from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from .quant_linear import make_replicated_quant
+
+
+def _gdn_dbg(layer_id, tag, t) -> None:
+    if not os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+        return
+    try:
+        f = t.float()
+        bad = torch.isinf(f) | torch.isnan(f)
+        if bool(bad.any()):
+            bad_rows = bad.any(dim=-1)
+            first = int(bad_rows.nonzero()[0].min()) if bad_rows.any() else -1
+            from freetoken.utils import init_logger
+
+            init_logger("freetoken.qwen4exp.layerdbg").warning(
+                "LAYERDBG_GDN layer=%s tag=%s maxnorm=%.4g inf=%s nan=%s first_bad_row=%s shape=%s",
+                layer_id, tag, float(f.norm(dim=-1).max()),
+                bool(torch.isinf(f).any()), bool(torch.isnan(f).any()), first,
+                tuple(t.shape),
+            )
+    except Exception:
+        pass
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -150,6 +173,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         pool = ctx.linear_state_pool
         total = hidden_states.shape[0]
         dtype = hidden_states.dtype
+        _gdn_dbg(self.layer_id, "gdn_in", hidden_states)
 
         # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
         # built once and shared by all GDN layers. The scheduler/graph set it; build it
@@ -169,6 +193,26 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
+        _gdn_dbg(self.layer_id, "proj", conv_in)
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                w = self.in_proj.weight if hasattr(self, "in_proj") else self.in_proj_ba.weight
+                wf = w.float()
+                if bool((torch.isinf(wf) | torch.isnan(wf)).any()) or float(wf.abs().max()) > 1e6:
+                    from freetoken.utils import init_logger
+
+                    init_logger("freetoken.qwen4exp.layerdbg").warning(
+                        "LAYERDBG_GDN layer=%s tag=W_anom maxabs=%.4g inf=%s nan=%s shape=%s",
+                        self.layer_id, float(wf.abs().max()),
+                        bool(torch.isinf(wf).any()), bool(torch.isnan(wf).any()),
+                        tuple(w.shape),
+                    )
+            except Exception:
+                pass
+            _gdn_dbg(self.layer_id, "proj_full", proj)
+            _gdn_dbg(self.layer_id, "z", z)
+            _gdn_dbg(self.layer_id, "b", b)
+            _gdn_dbg(self.layer_id, "a", a)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
@@ -190,12 +234,15 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            _gdn_dbg(self.layer_id, "conv", mixed)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
             g, beta = self._gate_params(a, b)
+            _gdn_dbg(self.layer_id, "beta", beta)
+            _gdn_dbg(self.layer_id, "g", g)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
@@ -216,8 +263,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
+        _gdn_dbg(self.layer_id, "core", core_out)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        _gdn_dbg(self.layer_id, "norm_out", out)
         return self.out_proj.forward(out)
 
 

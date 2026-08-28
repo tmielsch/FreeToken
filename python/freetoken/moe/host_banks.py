@@ -71,6 +71,58 @@ def born_pinned_default() -> bool:
     return False
 
 
+def _diagnose_mmap_failure(asize: int, nbytes: int) -> None:
+    try:
+        import ctypes.wintypes as wt
+        try:
+            from ctypes import Structure, c_uint64, c_ulong, sizeof
+
+            class MEMORYSTATUSEX(Structure):
+                _fields_ = [
+                    ("dwLength", c_ulong),
+                    ("dwMemoryLoad", c_ulong),
+                    ("ullTotalPhys", c_uint64),
+                    ("ullAvailPhys", c_uint64),
+                    ("ullTotalPageFile", c_uint64),
+                    ("ullAvailPageFile", c_uint64),
+                    ("ullTotalVirtual", c_uint64),
+                    ("ullAvailVirtual", c_uint64),
+                    ("ullAvailExtendedVirtual", c_uint64),
+                ]
+
+            m = MEMORYSTATUSEX()
+            m.dwLength = sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            class PROCMEM(Structure):
+                _fields_ = [
+                    ("cb", c_ulong),
+                    ("PageFaultCount", c_ulong),
+                    ("PeakWorkingSetSize", wt.SIZE_T),
+                    ("WorkingSetSize", wt.SIZE_T),
+                    ("QuotaPeakPagedPoolUsage", wt.SIZE_T),
+                    ("QuotaPagedPoolUsage", wt.SIZE_T),
+                    ("QuotaPeakNonPagedPoolUsage", wt.SIZE_T),
+                    ("QuotaNonPagedPoolUsage", wt.SIZE_T),
+                    ("PagefileUsage", wt.SIZE_T),
+                    ("PeakPagefileUsage", wt.SIZE_T),
+                    ("PrivateUsage", wt.SIZE_T),
+                ]
+
+            pm = PROCMEM()
+            pm.cb = sizeof(PROCMEM)
+            ctypes.windll.kernel32.K32GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pm), sizeof(pm))
+            logger.warning(
+                "HostBank mmap failure asize=%d nbytes=%d sys avphys=%.1fGiB availpf=%.1fGiB "
+                "process_private=%.1fGiB process_peak_ws=%.1fGiB live_banks=%d",
+                asize, nbytes, m.ullAvailPhys / 2**30, m.ullAvailPageFile / 2**30,
+                pm.PrivateUsage / 2**30, pm.PeakWorkingSetSize / 2**30, len(_LIVE_BUFFERS),
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
@@ -105,7 +157,11 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            try:
+                self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            except OSError as exc:
+                _diagnose_mmap_failure(asize, self.nbytes)
+                raise
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False

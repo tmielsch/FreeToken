@@ -1309,7 +1309,23 @@ class OffloadMoeCache:
             n_valid = self.num_experts
             for per_layer, cache in self.banks:
                 src = per_layer[layer_id]
+                if src.shape[0] < n_valid or cache.shape[0] < n_valid:
+                    raise RuntimeError(
+                        f"_copy_missing_windows geom-prefill OOB layer={layer_id} "
+                        f"src_rows={src.shape[0]} cache_rows={cache.shape[0]} n_valid={n_valid}"
+                    )
                 sel = src[:n_valid]
+                if sel.shape[1] > cache.shape[1]:
+                    raise RuntimeError(
+                        f"_copy_missing_windows geom-prefill col-OOB layer={layer_id} "
+                        f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
+                    )
+                if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+                    logger.info(
+                        "MOECACHE geom_prefill layer=%d n_valid=%d dst_rows=%d src_cols=%d into=%s",
+                        layer_id, n_valid, cache.shape[0], sel.shape[1],
+                        tuple(c.shape for c in (cache,)),
+                    )
                 cache[:n_valid, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
             return
 
@@ -1320,9 +1336,35 @@ class OffloadMoeCache:
                 return
             dst_slots = pool.evict_slots[:n_valid].long()
             src_idx = pool.src_indices[:n_valid].cpu()
+            dst_lo = int(dst_slots.min().item())
+            dst_hi = int(dst_slots.max().item())
+            src_lo = int(src_idx.min().item())
+            src_hi = int(src_idx.max().item())
+            if dst_lo < 0 or dst_hi >= pool.cache_size:
+                raise RuntimeError(
+                    f"_copy_missing_windows pool-dst OOB layer={layer_id} n_valid={n_valid} "
+                    f"dst=[{dst_lo},{dst_hi}] pool_slots={pool.cache_size}"
+                )
+            for name, view in zip(self.bank_schema, pool.bank_views):
+                src = self.bank_sources[name][layer_id]
+                if src_lo < 0 or src_hi >= src.shape[0] or view.shape[0] < n_valid:
+                    raise RuntimeError(
+                        f"_copy_missing_windows pool-src OOB layer={layer_id} bank={name} "
+                        f"src=[{src_lo},{src_hi}] src_rows={src.shape[0]} n_valid={n_valid}"
+                    )
+            if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+                logger.info(
+                    "MOECACHE pool_copy layer=%d n_valid=%d dst=[%d,%d] src=[%d,%d] pool_slots=%d",
+                    layer_id, n_valid, dst_lo, dst_hi, src_lo, src_hi, pool.cache_size,
+                )
             for name, view in zip(self.bank_schema, pool.bank_views):
                 src = self.bank_sources[name][layer_id]
                 sel = src.index_select(0, src_idx)
+                if sel.shape[1] > view.shape[1]:
+                    raise RuntimeError(
+                        f"_copy_missing_windows pool-col OOB layer={layer_id} bank={name} "
+                        f"sel_cols={sel.shape[1]} view_cols={view.shape[1]}"
+                    )
                 view[dst_slots, : sel.shape[1]] = sel.to(view.device, non_blocking=True)
             return
 
@@ -1331,8 +1373,27 @@ class OffloadMoeCache:
             return
         dst_slots = self.evict_slots[:n_valid].long()
         src_idx = self.src_indices[:n_valid].cpu()
+        dst_lo = int(dst_slots.min().item())
+        dst_hi = int(dst_slots.max().item())
+        src_lo = int(src_idx.min().item())
+        src_hi = int(src_idx.max().item())
+        if dst_lo < 0 or dst_hi >= min(c.shape[0] for _, c in self.banks):
+            raise RuntimeError(
+                f"_copy_missing_windows legacy-dst OOB layer={layer_id} n_valid={n_valid} "
+                f"dst=[{dst_lo},{dst_hi}] cache_rows={[c.shape[0] for _, c in self.banks]}"
+            )
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            logger.info(
+                "MOECACHE legacy_copy layer=%d n_valid=%d dst=[%d,%d] src=[%d,%d]",
+                layer_id, n_valid, dst_lo, dst_hi, src_lo, src_hi,
+            )
         for per_layer, cache in self.banks:
             src = per_layer[layer_id]
+            if src_lo < 0 or src_hi >= src.shape[0] or cache.shape[0] < n_valid:
+                raise RuntimeError(
+                    f"_copy_missing_windows legacy-src OOB layer={layer_id} "
+                    f"src=[{src_lo},{src_hi}] src_rows={src.shape[0]} n_valid={n_valid}"
+                )
             sel = src.index_select(0, src_idx)
             cache[dst_slots, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
 

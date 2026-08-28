@@ -956,6 +956,28 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        debug_on = os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag")
+        if getattr(self, "_debug_logits", False) or debug_on:
+            try:
+                float_logits = batch_logits.float()
+                top = torch.topk(float_logits, min(10, batch_logits.shape[-1]), dim=-1)
+                logsum = torch.logsumexp(float_logits, dim=-1)
+                for r_i, req in enumerate(batch.reqs[: batch.size]):
+                    ids = top.indices[r_i].tolist()
+                    logv = top.values[r_i].tolist()
+                    probs = [float(2.718281828 ** (min(lv - float(logsum[r_i]), 0.0))) for lv in logv]
+                    try:
+                        tail = req.input_ids[-6:].tolist() if req.input_ids.numel() else []
+                        ntok = req.input_ids.numel()
+                    except Exception:
+                        tail, ntok = [], -1
+                    logger.info(
+                        "DEBUGA row=%d uid=%d decode=%s cl=%d dl=%d ntok=%d tail=%s max=%d top10=%s probs=%s",
+                        r_i, req.uid, batch.is_decode, req.cached_len, req.device_len,
+                        ntok, tail, ids[0], ids, [round(p, 5) for p in probs],
+                    )
+            except Exception:  # pragma: no cover
+                pass
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
