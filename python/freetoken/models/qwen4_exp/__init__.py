@@ -1,5 +1,6 @@
 from .config import parse_config
-from .gguf import gguf_quant_inventory, iter_gguf_weights, parse_gguf_config
+from .gguf import gguf_quant_inventory, parse_gguf_config
+from .gguf_weights import iter_gguf_weights_impl as iter_gguf_weights
 from .model import Qwen4ExpForCausalLM
 from .weight import (
     iter_weights,
