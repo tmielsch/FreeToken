@@ -3,7 +3,16 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <torch/all.h>
+// Windows SDK's rpcndr.h defines `small` as `char`, which collides with
+// c10::cuda::CUDACachingAllocator::StreamSegmentSize(bool small, ...).
+// The local shadow header clears it immediately before that Torch header.
+#ifdef small
+#undef small
+#endif
+#include <torch/extension.h>
+#ifdef small
+#undef small
+#endif
 
 // dont use clang-format here, it breaks the include order
 // clang-format off

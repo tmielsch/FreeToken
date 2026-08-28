@@ -65,10 +65,32 @@ def _module():
     extra_cflags: list[str] = []
     if os.name == "nt":
         # CUDA 13.2's CCCL requires the conforming MSVC preprocessor.
-        extra_cuda_cflags += ["-Xcompiler", "/Zc:preprocessor"]
-        extra_cflags += ["/Zc:preprocessor", "/DNOMINMAX"]
+        extra_cuda_cflags += ["-Xcompiler", "/Zc:preprocessor", "-Xcompiler", "/bigobj"]
+        extra_cflags += ["/Zc:preprocessor", "/DNOMINMAX", "/bigobj"]
         # Torch already injects /DNOMINMAX via cpp_extension, but repeat for the JIT's
         # extra_cflags path which is MSVC-direct.
+        # Host compiler for the CUDA file may need extra heap for the huge ATen headers.
+        extra_cuda_cflags += ["-Xcompiler", "/Zm800"]
+        extra_cflags += ["/Zm800"]
+        # compiled_autograd.h has a Windows guard that requires USE_CUDA to be
+        # defined to avoid a known `if constexpr` + `std` ambiguity on MSVC.
+        # Ensure the guard fires during the host compilation of the .cu file.
+        extra_cuda_cflags += ["-DUSE_CUDA", "-Xcompiler", "/DUSE_CUDA"]
+        extra_cflags += ["/DUSE_CUDA"]
+        allocator_header = (
+            pathlib.Path(torch.__file__).resolve().parent
+            / "include"
+            / "c10"
+            / "cuda"
+            / "CUDACachingAllocator.h"
+        )
+        if not allocator_header.is_file():
+            raise RuntimeError(f"Torch CUDA header not found: {allocator_header}")
+        # The Windows-only shadow header uses this absolute path to include the
+        # matching installed Torch header after it clears rpcndr.h's `small`.
+        extra_cuda_cflags += [
+            f'-DFREETOKEN_CUDA_CACHING_ALLOCATOR_HEADER=\\"{allocator_header.as_posix()}\\"'
+        ]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
@@ -81,10 +103,13 @@ def _module():
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
+    # On Windows, shadow CUDACachingAllocator.h with a tiny wrapper that removes
+    # rpcndr.h's `small` macro, then includes the matching installed Torch header.
+    include_dirs = [str(_CSRC / "torch_fix"), str(_CSRC)] if os.name == "nt" else [str(_CSRC)]
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        extra_include_paths=include_dirs,
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
