@@ -71,11 +71,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen4_exp",
         "Qwen4ExpForCausalLM",
     ),
-    # Native llama.cpp/Unsloth GGUF for Qwen3.8-Flash-Next. The model class is
-    # shared, while config and weight loading come from the qwen4_exp GGUF adapter.
+    # Native llama.cpp/Unsloth GGUF for Qwen3.8-Flash-Next. The GGUF runtime swaps
+    # resident matrices to native GGUF ops, mmap-gathers PLE rows, and supplies
+    # heterogeneous routed-expert banks to the generic geometry cache.
     "Qwen4ExpGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen4_exp",
-        "Qwen4ExpForCausalLM",
+        "Qwen4ExpGGUFForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
