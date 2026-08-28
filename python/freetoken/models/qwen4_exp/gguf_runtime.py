@@ -4,9 +4,6 @@ The earlier branch-local prototype implemented its own variable-stride cache and
 copy path. That is intentionally gone: upstream #199 already teaches the normal
 ``OffloadMoeCache`` to keep compact heterogeneous host rows and carve decode pools
 per row geometry. Qwen4Exp only supplies its per-layer ggml types and expert banks.
-
-This class is deliberately not registered until dense/PLE GGUF weight mapping is
-complete, so these hooks cannot accidentally make a partial model serve.
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ from .model import Qwen4ExpForCausalLM
 
 
 class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
-    """Qwen4Exp with native mixed-type GGUF routed experts."""
+    """Qwen4Exp with native mixed-type GGUF resident weights + routed experts."""
 
     def __init__(self, config):
         from freetoken.moe import is_offload_moe_backend
@@ -30,6 +27,33 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
             )
         super().__init__(config)
 
+        model_path = getattr(config.qwen4_args, "gguf_model_path", None)
+        if not model_path:
+            raise ValueError("Qwen3.8 GGUF config does not carry its source GGUF path")
+
+        # Swap the resident Q8/Q6/mixed-GDN modules before the engine collects
+        # state_dict(), so packed qweight buffers have their exact per-tensor sizes.
+        from .gguf_weights import convert_qwen4exp_to_gguf
+
+        convert_qwen4exp_to_gguf(self, config, model_path=model_path)
+
+        # The PLE table is host state rather than an ordinary state_dict tensor.
+        # Replace the HF FP8-shard object with the GGUF mmap row-gather object.
+        from .gguf import _tensor_types_header_only
+        from .gguf_ple import GGUFHostNGramEmbedding
+
+        tensor_types = _tensor_types_header_only(model_path)
+        ple_type = tensor_types.get("per_layer_token_embd.weight")
+        if config.qwen4_args.ple_layer_ids and ple_type is None:
+            raise ValueError(
+                "Qwen3.8 GGUF declares PLE layers but has no per_layer_token_embd.weight"
+            )
+        for layer_id, layer in enumerate(self.model.layers.op_list):
+            if layer.ple is not None:
+                layer.ple.ple_embedding = GGUFHostNGramEmbedding(
+                    config, layer_id, int(ple_type)
+                )
+
         types = getattr(config.qwen4_args, "gguf_expert_types", None)
         if not types or len(types) != config.num_moe_layers:
             raise ValueError(
@@ -37,7 +61,7 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
             )
 
         # The generic OffloadMoELayer's quant_format == "gguf" branch reads these
-        # four attributes to dispatch the correct ggml MoE kernel for each layer.
+        # attributes to dispatch the correct ggml MoE kernel for each layer.
         for layer_id, layer in enumerate(self.model.layers.op_list):
             experts = layer.mlp.experts
             if not isinstance(experts, OffloadMoELayer):
@@ -93,15 +117,9 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
         return cache
 
     def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        if dummy:
-            # The inherited PLE object knows how to become a zero-producing dummy
-            # without opening safetensors.
-            self.model.load_host_weights(model_path, dummy=True)
-            return
-        raise NotImplementedError(
-            "Qwen3.8 GGUF PLE host embedding mapping is not wired yet; "
-            "the runtime class stays unregistered until that phase is complete"
-        )
+        # After __init__ the only host-owned weight object is GGUFHostNGramEmbedding;
+        # Qwen4ExpModel already walks every PLE layer and calls this method on it.
+        self.model.load_host_weights(model_path, dummy=dummy)
 
 
 __all__ = ["Qwen4ExpGGUFForCausalLM"]
