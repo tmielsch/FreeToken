@@ -93,20 +93,17 @@ def main() -> None:
                         f"{tensor.name}: fastest dim {fast} is not divisible by {block} ({qtype})"
                     )
                 row_bytes = fast // block * type_size
-                rows = 1
+                rows_per_expert = 1
                 for value in ne[1:-1]:
-                    rows *= value
+                    rows_per_expert *= value
                 # qwen4exp expert tensors are [fast input, output, experts] in ggml order.
-                # The final dimension is the expert count, so one expert owns all rows
-                # before it. Keep both raw dims and the byte count for easy auditing.
-                experts = ne[-1] if len(ne) >= 3 else 1
-                total_bytes = int(tensor.n_bytes) if hasattr(tensor, "n_bytes") else row_bytes
+                # One expert therefore owns rows_per_expert contiguous quantized rows.
                 expert_layers[layer][proj] = {
                     "type": qtype,
                     "ggml_type": int(tensor.tensor_type),
                     "shape_ggml": ne,
                     "row_bytes": row_bytes,
-                    "bytes_per_expert": total_bytes // experts,
+                    "bytes_per_expert": row_bytes * rows_per_expert,
                 }
             else:
                 dense_types[qtype] += 1
