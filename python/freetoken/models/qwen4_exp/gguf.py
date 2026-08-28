@@ -331,12 +331,15 @@ def iter_gguf_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Qwen4Exp GGUF weight adapter; mixed-quant mapping lands in the next port layer."""
-    raise NotImplementedError(
-        "Qwen4Exp GGUF config/split support is active, but mixed-quant weight "
-        "mapping is not wired yet"
+    """Load resident Qwen4Exp GGUF weights through the filtered payload adapter."""
+    from .gguf_weights import iter_gguf_weights_impl
+
+    yield from iter_gguf_weights_impl(
+        model_path,
+        device,
+        include_moe_experts=include_moe_experts,
+        include_non_moe=include_non_moe,
     )
-    yield  # pragma: no cover
 
 
 def is_gguf_model(config: ModelConfig) -> bool:
