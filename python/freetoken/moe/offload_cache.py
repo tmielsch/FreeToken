@@ -1295,6 +1295,47 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    def _copy_missing_windows(self, layer_id: int) -> None:
+        """Windows fallback: pure-PyTorch expert-cache miss copy.
+
+        The tvm-ffi fused multi-bank kernels fail to compile on MSVC
+        (TensorMatcher overload issue). This fallback does the same H2D copy
+        with plain index_select + indexed assignment, slower but correct.
+        Handles all three normal dispatch targets: whole-layer geometry
+        prefill, geometry-pool decode misses (whose state lives on the pool),
+        and the legacy unified-cache miss copy.
+        """
+        if self._pending_geometry_prefill:
+            n_valid = self.num_experts
+            for per_layer, cache in self.banks:
+                src = per_layer[layer_id]
+                sel = src[:n_valid]
+                cache[:n_valid, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
+            return
+
+        pool = self._pending_geometry_pool
+        if pool is not None:
+            n_valid = int(pool.num_indices.item())
+            if n_valid == 0:
+                return
+            dst_slots = pool.evict_slots[:n_valid].long()
+            src_idx = pool.src_indices[:n_valid].cpu()
+            for name, view in zip(self.bank_schema, pool.bank_views):
+                src = self.bank_sources[name][layer_id]
+                sel = src.index_select(0, src_idx)
+                view[dst_slots, : sel.shape[1]] = sel.to(view.device, non_blocking=True)
+            return
+
+        n_valid = int(self.num_indices.item())
+        if n_valid == 0:
+            return
+        dst_slots = self.evict_slots[:n_valid].long()
+        src_idx = self.src_indices[:n_valid].cpu()
+        for per_layer, cache in self.banks:
+            src = per_layer[layer_id]
+            sel = src.index_select(0, src_idx)
+            cache[dst_slots, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
