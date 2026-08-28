@@ -57,6 +57,7 @@ def _vswhere_path() -> Path | None:
 
 
 def _vs_install_path() -> Path | None:
+    """Find a Visual Studio installation carrying the x64 C++ tools."""
     vswhere = _vswhere_path()
     if vswhere is not None:
         try:
@@ -73,11 +74,12 @@ def _vs_install_path() -> Path | None:
                 ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 check=True,
             )
-            install = proc.stdout.strip().splitlines()
-            if install:
-                candidate = Path(install[-1])
+            installs = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            if installs:
+                candidate = Path(installs[-1])
                 if candidate.is_dir():
                     return candidate
         except (OSError, subprocess.CalledProcessError):
@@ -122,9 +124,11 @@ def _vcvars64_path() -> Path | None:
     for root in roots:
         for year in ("2022", "2019"):
             for edition in editions:
-                candidate = root / year / edition / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-                if candidate.is_file():
-                    return candidate
+                candidate = root / year / edition
+                if candidate.is_dir():
+                    vcvars = candidate / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                    if vcvars.is_file():
+                        return vcvars
     return None
 
 
