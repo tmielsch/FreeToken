@@ -1299,6 +1299,13 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if sys.platform == "win32":
+            pool = self._pending_geometry_pool
+            if (
+                pool is not None and not self._pending_geometry_prefill
+            ) or self._copy_fused_ok:
+                self._copy_missing_windows(layer_id)
+                return
         if self._pending_geometry_prefill:
             for per_layer, cache in self.banks:
                 self._copy_compact_layer(
