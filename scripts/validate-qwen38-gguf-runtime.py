@@ -25,6 +25,8 @@ if str(PYTHON) not in sys.path:
 
 import torch
 
+import freetoken.models.qwen3_5_moe.attention as qwen35_attention
+import freetoken.models.qwen4_exp.model as qwen4_model
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.models import create_model
 from freetoken.models.gguf.config import build_gguf_shim
@@ -33,6 +35,47 @@ from freetoken.models.qwen4_exp.gguf import (
     _tensor_types_header_only,
     parse_gguf_config,
 )
+
+
+class _MetaRotaryStub:
+    """Construction-only RoPE stand-in for the meta-model smoke test.
+
+    The validator never executes a forward pass.  Returning the same structural
+    attributes lets Qwen3.5/Qwen4 attention objects construct without importing a
+    real Triton/FlashInfer RoPE kernel or allocating the full position cache.
+    """
+
+    def __init__(self, *, head_dim: int, rotary_dim: int, is_neox: bool = True):
+        self.head_size = int(head_dim)
+        self.rotary_dim = int(rotary_dim)
+        self.is_neox = bool(is_neox)
+        self._cos_sin_cache = torch.empty((0, 0), device="meta")
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - validator never executes
+        raise RuntimeError("meta RoPE stub cannot execute a forward pass")
+
+    def apply_inplace(self, *args, **kwargs):  # pragma: no cover
+        raise RuntimeError("meta RoPE stub cannot execute a forward pass")
+
+    def apply_rope_with_cos_sin_cache_inplace(self, *args, **kwargs):  # pragma: no cover
+        raise RuntimeError("meta RoPE stub cannot execute a forward pass")
+
+
+def _meta_get_rope(
+    *,
+    head_dim: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling=None,
+    is_neox: bool = True,
+):
+    del max_position, base, rope_scaling
+    return _MetaRotaryStub(
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        is_neox=is_neox,
+    )
 
 
 def _shape(state: dict[str, torch.Tensor], key: str) -> tuple[int, ...]:
@@ -83,8 +126,20 @@ def validate(model_path: str) -> None:
         )
 
     # Full model construction, but no storage allocation and no payload access.
-    with torch.device("meta"):
-        model = create_model(config)
+    # Qwen4 attention binds get_rope in two modules.  Stub both factories only for
+    # construction so this header/meta smoke does not depend on a Windows RoPE
+    # kernel package or allocate the 262k-position RoPE cache.
+    original_qwen35_get_rope = qwen35_attention.get_rope
+    original_qwen4_get_rope = qwen4_model.get_rope
+    qwen35_attention.get_rope = _meta_get_rope
+    qwen4_model.get_rope = _meta_get_rope
+    try:
+        with torch.device("meta"):
+            model = create_model(config)
+    finally:
+        qwen35_attention.get_rope = original_qwen35_get_rope
+        qwen4_model.get_rope = original_qwen4_get_rope
+
     if type(model).__name__ != "Qwen4ExpGGUFForCausalLM":
         raise RuntimeError(
             f"registry constructed {type(model).__name__}, expected Qwen4ExpGGUFForCausalLM"
@@ -134,7 +189,6 @@ def validate(model_path: str) -> None:
         )
 
     H = config.hidden_size
-    I = config.moe_intermediate_size
     E = config.num_experts
     embed_type = types.get("token_embd.weight")
     head_type = types.get("output.weight")
@@ -199,7 +253,11 @@ def validate(model_path: str) -> None:
     _expect_shape(
         state,
         f"model.layers.{gdn}.linear_attn.out_proj.weight",
-        (H, config.linear_attention_group().num_value_heads * config.linear_attention_group().value_head_dim),
+        (
+            H,
+            config.linear_attention_group().num_value_heads
+            * config.linear_attention_group().value_head_dim,
+        ),
     )
 
     ple_layers = tuple(args.ple_layer_ids)
@@ -233,15 +291,15 @@ def validate(model_path: str) -> None:
     print(f"  lm_head: {_fmt_type(head_type)}")
     print(
         "  PLE table: "
-        f"{_fmt_type(ple_type)}, {row_bytes(args.ple_embed_dim // ((args.ngram_size - 1) * args.heads_per_ngram), ple_type)} packed bytes/head-row"
+        f"{_fmt_type(ple_type)}, "
+        f"{row_bytes(args.ple_embed_dim // ((args.ngram_size - 1) * args.heads_per_ngram), ple_type)} "
+        "packed bytes/head-row"
     )
     print("  routed expert signatures (gate_up/down):")
     for (gate_up, down), count in sorted(
         expert_signatures.items(), key=lambda item: (-item[1], item[0])
     ):
-        print(
-            f"    {count:2d} layers: {_fmt_type(gate_up)} / {_fmt_type(down)}"
-        )
+        print(f"    {count:2d} layers: {_fmt_type(gate_up)} / {_fmt_type(down)}")
     print("  payload read: none (headers/meta model only)")
 
 
