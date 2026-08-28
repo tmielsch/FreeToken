@@ -11,13 +11,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from .reader import (
+    _reader,
     gguf_architecture,
+    gguf_split_paths,
     gguf_tensor_names,
-    iter_gguf_tensors,
     load_gguf_metadata,
 )
 
-# GGUF ``general.architecture`` -> FreeToken registry key.
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "qwen4exp": "Qwen4ExpGGUFForCausalLM",
@@ -34,7 +34,6 @@ class GgufConfigShim:
     tie_word_embeddings: bool
 
     def to_dict(self) -> dict[str, Any]:
-        """Minimal HF-config-like dict for trunk code that introspects config."""
         return {
             "architectures": list(self.architectures),
             "model_type": self.model_type,
@@ -45,11 +44,12 @@ class GgufConfigShim:
 
 
 def _vocab_size(model_path: str) -> int:
-    # Split GGUFs often place token_embd outside shard 1, so enumerate the whole family.
-    for t in iter_gguf_tensors(model_path):
-        if t.name == "token_embd.weight":
-            return int(t.shape[0])
-    # Metadata-only GGUF (FTW): use tokenizer vocabulary.
+    # Header-only: never touch the ~90 GB Unsloth payload just to size the vocab.
+    for path in gguf_split_paths(model_path):
+        for tensor in _reader(path).tensors:
+            if tensor.name == "token_embd.weight":
+                # ggml tensor shape is [hidden, vocab].
+                return int(tensor.shape[-1])
     toks = load_gguf_metadata(model_path).get("tokenizer.ggml.tokens")
     if toks is not None:
         return len(toks)
