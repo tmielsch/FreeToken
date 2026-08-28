@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import os
 import signal
+import subprocess
 import time
 from typing import Iterable
 
@@ -117,7 +118,27 @@ def signal_group(pid: int, sig: int) -> None:
     """Signal the serve's whole process group. Resolves the pgid and asserts ``pgid == pid``
     (the group-leader invariant of our own spawn) before ``killpg``; on any mismatch or lookup
     failure it falls back to signalling just the pid, so a re-adopted process with an unexpected
-    group is never able to make us nuke an innocent group."""
+    group is never able to make us nuke an innocent group.
+
+    Windows has neither process groups nor graceful signal delivery (``os.kill`` with
+    anything but SIGINT/CTRL_C_EVENT is a bare ``TerminateProcess`` of one pid, which
+    orphans the mp-spawned scheduler/tokenizer workers -- observed holding VRAM and
+    their c10d ports). ``taskkill /T /F`` is the tree-wide equivalent and can only
+    ever descend from ``pid``, so the innocent-group hazard does not exist there; the
+    manager's SIGTERM->grace->SIGKILL ladder collapses to a single effective call."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:  # pragma: no cover - defensive
+            pass
+        except subprocess.SubprocessError:  # pragma: no cover - defensive
+            pass
+        return
     pgid = proc_pgid(pid)
     try:
         if pgid is not None and pgid == pid:

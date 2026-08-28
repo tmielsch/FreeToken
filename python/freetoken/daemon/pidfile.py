@@ -19,18 +19,34 @@ class AlreadyRunning(RuntimeError):
     """Another daemon holds the single-instance lock."""
 
 
+def _lock_exclusive_nowait(fd: int) -> None:
+    """Nonblocking exclusive lock on an open file, held until the fd closes.
+
+    POSIX: ``flock``. Windows has no flock; ``msvcrt`` byte-range locking is the
+    equivalent (a lock on byte 0 — allowed past EOF — released by the OS when the
+    fd or process dies, exactly the crash-safety property we need).
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
+
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 class SingleInstance:
     def __init__(self, path: str) -> None:
         self.path = path
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
-
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive_nowait(fd)
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc

@@ -1,8 +1,10 @@
 """FreeToken inference runtime."""
 
-from freetoken.kernel.triton.windows_compat import install_windows_triton_driver_patch
 from freetoken.version import __version__
 
-install_windows_triton_driver_patch()
+# NOTE: the Windows Triton driver MSVC patch is armed at the top of
+# freetoken.kernel.__init__ instead of here: importing the kernel package chain
+# here would import torch at bare ``import freetoken`` time, which breaks the
+# daemon's torch-free guarantee (tests/daemon/test_daemon_import_safety.py).
 
 __all__ = ["__version__"]

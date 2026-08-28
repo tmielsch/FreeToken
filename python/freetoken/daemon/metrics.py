@@ -8,12 +8,18 @@ absent NVML returns 0, never an error."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
 from typing import Callable
 
 from . import osproc
+
+# No console window for background probe children on Windows (the desktop app
+# polls metrics every 1-2s; a console-attached nvidia-smi spawn flashes a window
+# each time). CREATE_NO_WINDOW only exists on win32; 0 is the no-op elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 def engine_footprint(pid: int | None) -> dict:
@@ -120,6 +126,7 @@ def _smi_process_vram() -> dict[int, int]:
             capture_output=True,
             text=True,
             timeout=3.0,
+            creationflags=_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return {}

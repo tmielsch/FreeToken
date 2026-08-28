@@ -1,5 +1,13 @@
 import os as _os
 
+# Arm the MSVC C11 workaround for Triton's in-memory cuda_utils compile. This
+# package is the gateway to every Triton kernel, so arming here is still before
+# any compilation — while keeping bare ``import freetoken`` (e.g. the daemon)
+# torch-free.
+from .triton.windows_compat import install_windows_triton_driver_patch as _inst_win32_triton
+
+_inst_win32_triton()
+
 
 _installed_kernel_dir = _os.environ.get("FREETOKEN_INSTALLED_KERNEL_DIR")
 if (

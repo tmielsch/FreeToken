@@ -123,6 +123,13 @@ def build_serve_command(
     """The serve invocation + its log path. ``python -m freetoken.cli serve`` (NOT ``-m
     freetoken``, which is a direct-server entrypoint that ignores subcommand argv) so it uses the
     daemon's own interpreter/venv with no PATH dependency."""
+    if os.name == "nt" and os.path.basename(python).lower() == "pythonw.exe":
+        # pythonw.exe ships sys.stdout/sys.stderr as None (no console); the backend workers
+        # crash at startup with AttributeError: 'NoneType' object has no attribute 'flush'.
+        # The serve's stdio goes to the logfile fd anyway, so the console sibling is a drop-in.
+        console_python = os.path.join(os.path.dirname(python), "python.exe")
+        if os.path.isfile(console_python):
+            python = console_python
     argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port), *args]
     log_path = os.path.join(log_dir, f"serve-{port}.log")
     return argv, log_path
