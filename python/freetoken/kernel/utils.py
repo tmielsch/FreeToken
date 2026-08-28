@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import functools
 import os
 import pathlib
 import re
@@ -23,6 +24,29 @@ DEFAULT_CFLAGS = (
 )
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
+
+
+@functools.cache
+def _patch_tvm_ffi_windows_cuda_flags() -> None:
+    """Fix tvm-ffi's malformed Windows nvcc host-compiler flag sequence."""
+    if sys.platform != "win32":
+        return
+    import tvm_ffi.cpp.extension as extension
+
+    if getattr(extension, "_freetoken_windows_cuda_flags_patch", False):
+        return
+    generate = extension._generate_ninja_build
+
+    @functools.wraps(generate)
+    def generate_ninja_build(*args, **kwargs):
+        ninja = generate(*args, **kwargs)
+        return ninja.replace(
+            "-Xcompiler /std:c++17 /O2",
+            "-Xcompiler /std:c++17 -Xcompiler /O2",
+        )
+
+    extension._generate_ninja_build = generate_ninja_build
+    extension._freetoken_windows_cuda_flags_patch = True
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
@@ -266,6 +290,7 @@ def load_jit(
 
         check_nvcc_matches_torch()
 
+    _patch_tvm_ffi_windows_cuda_flags()
     from tvm_ffi.cpp import load_inline
 
     cpp_files = cpp_files or []
