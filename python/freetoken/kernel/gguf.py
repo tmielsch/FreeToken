@@ -62,6 +62,13 @@ def _module():
     check_nvcc_matches_torch()
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    extra_cflags: list[str] = []
+    if os.name == "nt":
+        # CUDA 13.2's CCCL requires the conforming MSVC preprocessor.
+        extra_cuda_cflags += ["-Xcompiler", "/Zc:preprocessor"]
+        extra_cflags += ["/Zc:preprocessor", "/DNOMINMAX"]
+        # Torch already injects /DNOMINMAX via cpp_extension, but repeat for the JIT's
+        # extra_cflags path which is MSVC-direct.
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
@@ -78,6 +85,7 @@ def _module():
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
+        extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )

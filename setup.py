@@ -55,9 +55,12 @@ def _cxx_args(*, cpu_moe: bool = False) -> list[str]:
     CUDA/Torch headers can pull in Windows headers that define ``min`` and
     ``max`` macros. Those corrupt ordinary C++ calls such as ``std::min(...)``
     in cpu_moe_ext.cpp, so suppress them globally for native Windows builds.
+
+    CUDA 13.2 ships CCCL which requires the conforming MSVC preprocessor
+    (``/Zc:preprocessor``), otherwise it hard-errors via preprocessor.h.
     """
     if os.name == "nt":
-        return ["/O2", "/std:c++17", "/DNOMINMAX"]
+        return ["/O2", "/std:c++17", "/Zc:preprocessor", "/DNOMINMAX"]
     args = ["-O3", "-std=c++17"]
     if cpu_moe:
         args.append("-pthread")
