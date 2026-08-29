@@ -113,16 +113,16 @@ struct IndexKernel {
     auto indices_dtype_ = SymbolicDType{};
 
     TensorMatcher({-1, D}) //
-        .with_dtype(weights_dtype_)
         .with_device<kDLCUDA>(device_)
+        .with_dtype(weights_dtype_)
         .verify(weights);
     TensorMatcher({L, D}) //
-        .with_dtype(weights_dtype_)
         .with_device<kDLCUDA>(device_)
+        .with_dtype(weights_dtype_)
         .verify(output);
     TensorMatcher({L}) //
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
         .with_device<kDLCUDA>(device_)
+        .with_dtype<int32_t, int64_t>(indices_dtype_)
         .verify(indices);
 
     const auto device = device_.unwrap();
