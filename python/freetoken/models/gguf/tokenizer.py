@@ -55,6 +55,14 @@ def load_gguf_tokenizer(model_path: str):
     )
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:
+        if str(meta.get("general.architecture", "")).lower() == "qwen4exp":
+            # Qwen3.8's template pre-opens <think> in the generation prompt, but
+            # the checkpoint derails (immediate eos) when the last prefill token
+            # is the pre-opened <think>. Let the model emit the tag itself:
+            # verified end-to-end (identical reasoning, correct answer).
+            chat_template = chat_template.replace(
+                r"{{- '<think>\n' }}", "{{- '' }}"
+            )
         tokenizer.chat_template = chat_template
     return tokenizer
 
