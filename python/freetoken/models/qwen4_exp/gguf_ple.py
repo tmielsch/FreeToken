@@ -162,14 +162,20 @@ class GGUFPLETableBackend:
                 f"PLE row id range [{lo}, {hi}] outside [0, {self.num_rows})"
             )
 
+        # NGramEmbedding computes row ids on the GPU; the packed source rows
+        # live in the file mmap, so the gather runs on the CPU. This D2H sync
+        # replaces the old host-side id computation (correctness-first; an
+        # async pipeline can overlap it with the layer-0 work later).
+        ids_cpu = ids.to("cpu", non_blocking=False)
+
         # Gather into a tiny pinned staging buffer: 16 rows/token * 90 bytes/row
         # for the current IQ4_NL model. The ~29 GiB source remains file-backed.
         staging = torch.empty(
-            (ids.numel(), self._row_bytes),
+            (ids_cpu.numel(), self._row_bytes),
             dtype=torch.uint8,
             pin_memory=torch.cuda.is_available(),
         )
-        torch.index_select(self._packed_rows, 0, ids, out=staging)
+        torch.index_select(self._packed_rows, 0, ids_cpu, out=staging)
 
         if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
             try:
