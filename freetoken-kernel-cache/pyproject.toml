@@ -42,4 +42,4 @@ packages = ["freetoken_kernel_cache"]
 version = {attr = "freetoken_kernel_cache.__version__"}
 
 [tool.setuptools.package-data]
-freetoken_kernel_cache = ["jit_cache/**/*.so", "_build_meta.py"]
+freetoken_kernel_cache = ["jit_cache/**/*.so", "jit_cache/**/*.dll", "_build_meta.py"]
