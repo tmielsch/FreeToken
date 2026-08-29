@@ -530,14 +530,14 @@ struct MultiIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_device<kDLCUDA>(device).with_dtype<int64_t>(ptr_dtype)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_device<kDLCUDA>(device).with_dtype<int32_t, int64_t>(indices_dtype)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_device<kDLCUDA>(device).with_dtype<int64_t>(num_indices_dtype)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
@@ -633,15 +633,15 @@ struct MultiStridedIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_device<kDLCUDA>(device).with_dtype<int64_t>(ptr_dtype)
             .verify(dst_ptrs).verify(src_ptrs).verify(copy_bytes)
             .verify(dst_row_strides).verify(src_row_strides);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_device<kDLCUDA>(device).with_dtype<int32_t, int64_t>(indices_dtype)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_device<kDLCUDA>(device).with_dtype<int64_t>(num_indices_dtype)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
@@ -710,7 +710,7 @@ struct StridedRowsCopyKernel {
         auto device = SymbolicDevice{};
         auto R = SymbolicSize{"rows"};
         auto D = SymbolicSize{"destination stride"};
-        TensorMatcher({R, D}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(dst);
+        TensorMatcher({R, D}).with_device<kDLCUDA>(device).with_dtype<uint8_t>().verify(dst);
         assert(rows == static_cast<int64_t>(R.unwrap()));
         assert(copy_bytes > 0 && (copy_bytes & 15) == 0);
         assert(src_stride >= copy_bytes && (src_stride & 15) == 0);
