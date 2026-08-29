@@ -417,12 +417,17 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # Models whose forward performs host-side dynamic work (the GGUF PLE
+        # backend: file-mmap row gathers + device syncs) declare
+        # supports_cuda_graph=False; force an empty size list so GraphRunner
+        # takes its disabled/eager path instead of dying during capture.
+        model_can_capture = getattr(config.model_config, "supports_cuda_graph", True)
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=[] if not model_can_capture else config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,

@@ -313,6 +313,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
         requires_naive_cache=True,
+        # The GGUF PLE backend gathers packed rows on the host (file mmap +
+        # pinned staging + sync down of the row ids), which is not
+        # CUDA-graph-capturable; the HF path's UVA triton gather is. Serve the
+        # GGUF path eager until the backend gets a capture-safe pipeline.
         supports_cuda_graph=False,
     )
 
