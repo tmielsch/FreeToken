@@ -51,13 +51,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return _zmq_addr("freetoken_3", 3)
+        return _zmq_addr("freetoken_3", self._unique_suffix, 3)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = _zmq_addr("freetoken_4", 4)
+        result = _zmq_addr("freetoken_4", self._unique_suffix, 4)
         assert result != self.zmq_detokenizer_addr
         return result
 
