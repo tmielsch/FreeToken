@@ -1,4 +1,4 @@
-#include <freetoken/tensor.h>
+﻿#include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
 
@@ -68,16 +68,16 @@ struct StridedIndexCopyKernel {
         auto valid_dtype = SymbolicDType{};
 
         TensorMatcher({-1, Dst})
-            .with_dtype<uint8_t>()
             .with_device<kDLCUDA>(device)
+            .with_dtype<uint8_t>()
             .verify(dst);
         TensorMatcher({-1, Src})
-            .with_dtype<uint8_t>()
             .with_device<kDLCUDAHost, kDLCPU, kDLCUDA>()
+            .with_dtype<uint8_t>()
             .verify(src);
         TensorMatcher({L})
-            .with_dtype<int32_t, int64_t>(indices_dtype)
             .with_device<kDLCUDA>(device)
+            .with_dtype<int32_t, int64_t>(indices_dtype)
             .verify(dst_indices)
             .verify(src_indices);
 
@@ -91,8 +91,8 @@ struct StridedIndexCopyKernel {
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
             TensorMatcher({1})
-                .with_dtype<int64_t>(valid_dtype)
                 .with_device<kDLCUDA>(device)
+                .with_dtype<int64_t>(valid_dtype)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }

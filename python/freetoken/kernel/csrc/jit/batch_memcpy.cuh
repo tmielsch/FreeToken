@@ -1,4 +1,4 @@
-#include <freetoken/tensor.h>
+﻿#include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
 
@@ -25,8 +25,8 @@ struct BatchMemcpy {
         auto N = SymbolicSize{"batch length"};
         auto ptr_dtype = SymbolicDType{};
         TensorMatcher({N})
-            .with_dtype<int64_t>(ptr_dtype)
             .with_device<kDLCPU>()
+            .with_dtype<int64_t>(ptr_dtype)
             .verify(dst_ptrs)
             .verify(src_ptrs)
             .verify(sizes);

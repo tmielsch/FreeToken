@@ -1,4 +1,4 @@
-#include <freetoken/tensor.h>
+﻿#include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
 
@@ -269,8 +269,8 @@ inline auto get_sync_flag_ptr(
 ) -> int32_t* {
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
-        .with_dtype<int32_t>(flag_dtype)
         .with_device<kDLCUDA>(device)
+        .with_dtype<int32_t>(flag_dtype)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
@@ -344,18 +344,18 @@ struct FastIndexCopyKernel {
         auto num_indices_dtype = SymbolicDType{};
 
         TensorMatcher({-1, D})
-        .with_dtype(data_dtype)
         .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_dtype(data_dtype)
         .verify(src);
 
         TensorMatcher({-1, D})
-        .with_dtype(data_dtype)
         .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_dtype(data_dtype)
         .verify(dst);
 
         TensorMatcher({L})
-        .with_dtype<int32_t, int64_t>(indices_dtype)
         .with_device<kDLCUDA>(device)
+        .with_dtype<int32_t, int64_t>(indices_dtype)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -363,8 +363,8 @@ struct FastIndexCopyKernel {
         if (num_indices.has_value()) {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
-                .with_dtype<int64_t>(num_indices_dtype)
                 .with_device<kDLCUDA>(device)
+                .with_dtype<int64_t>(num_indices_dtype)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
