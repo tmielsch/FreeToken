@@ -429,7 +429,12 @@ def aggregate_fast_index_copy_feature_sizes() -> tuple[int, ...]:
     sizes: set[int] = set(TEST_FEATURE_SIZES)
     for model in SUPPORTED_MODELS:
         sizes.update(fast_index_copy_feature_sizes(model))
-    return tuple(sorted(sizes))
+    # fast_index_copy copies in 128-byte granularity (128 / kWorkerThreads per
+    # worker loop) and static-asserts that in load_vec; a row size that is not a
+    # 128-multiple (e.g. the 240/400-byte NVFP4 bank rows) has no compilable
+    # instantiation. Those geometries ride their own fused H2D paths, so they
+    # stay out of the prebuilt cache.
+    return tuple(sorted(s for s in sizes if s % 128 == 0))
 
 
 __all__ = [
