@@ -202,10 +202,13 @@ def _resolve_specs(specs: Iterable[KernelSpec | str] | None) -> tuple[KernelSpec
     return tuple(resolved)
 
 
+_SHARED_SUFFIX = ".dll" if os.name == "nt" else ".so"
+
+
 def _built_shared_object(build_dir: pathlib.Path, name: str) -> pathlib.Path:
     candidates = [
         path
-        for path in build_dir.rglob(f"{name}.so")
+        for path in build_dir.rglob(f"{name}{_SHARED_SUFFIX}")
         if path.parent.name == name or path.parent.name.startswith(f"{name}_")
     ]
     if not candidates:
@@ -219,7 +222,7 @@ def _copy_kernel(build_dir: pathlib.Path, out_dir: pathlib.Path, name: str) -> p
     if dst_dir.exists():
         shutil.rmtree(dst_dir)
     dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / f"{name}.so"
+    dst = dst_dir / f"{name}{_SHARED_SUFFIX}"
     shutil.copy2(src, dst)
     return dst
 
