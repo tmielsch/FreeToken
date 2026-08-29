@@ -48,39 +48,15 @@ class ServerArgs(SchedulerConfig):
     def share_tokenizer(self) -> bool:
         return self.num_tokenizer == 0
 
-    def _zmq_addr(self, channel: int) -> str:
-        if os.name == "nt":
-            # libzmq does not implement ipc:// on Windows.  Keep every internal
-            # socket on loopback, after the HTTP port and the distributed port.
-            port = self.server_port + 2 + channel
-            if port > 65535:
-                raise ValueError(
-                    f"server port {self.server_port} leaves no room for internal ports"
-                )
-            return f"tcp://127.0.0.1:{port}"
-        return f"ipc:///tmp/freetoken_{channel}{self._unique_suffix}"
-
-    @property
-    def zmq_backend_addr(self) -> str:
-        return self._zmq_addr(0)
-
-    @property
-    def zmq_detokenizer_addr(self) -> str:
-        return self._zmq_addr(1)
-
-    @property
-    def zmq_scheduler_broadcast_addr(self) -> str:
-        return self._zmq_addr(2)
-
     @property
     def zmq_frontend_addr(self) -> str:
-        return self._zmq_addr(3)
+        return "ipc:///tmp/freetoken_3" + self._unique_suffix
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = self._zmq_addr(4)
+        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -171,6 +147,8 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3_coder"
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
@@ -212,10 +190,9 @@ def parse_args(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
             return "deepseekv32"
-        if any(
-            tag in marker
-            for tag in ("qwen3", "qwen3.5", "qwen3_5", "qwen4_exp", "qwen4exp")
-        ):
+        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+            return "qwen3"
+        if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
             return "qwen3"
         if "glm" in marker:
             return "glm"

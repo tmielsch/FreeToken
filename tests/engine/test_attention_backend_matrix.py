@@ -24,7 +24,7 @@ from freetoken.models.config import (
 )
 
 
-def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0):
+def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0, index_ratio=1):
     return KVCacheGroupSpec(
         name=name,
         layer_ids=(0, 1),
@@ -34,6 +34,7 @@ def _spec(name, attn_type, *, mla=False, sliding_window=None, index_head_dim=0):
         mla=mla,
         index_head_dim=index_head_dim,
         num_index_layers=2 if index_head_dim else 0,
+        index_ratio=index_ratio,
         attn_type=attn_type,
     )
 
@@ -68,8 +69,10 @@ def _model_config(kind):
         # MiniMax-M3 shape: one FULL-family group, mla=False + index dims -> BSA.
         specs = (_spec("full", AttnType.BSA, index_head_dim=128),)
     elif kind == "qsa":
+        # Qwen3.8-Flash-Next shape: hybrid-linear + one FULL-family group whose index keys
+        # are compressed index_ratio:1 -> QSA.
         mc.has_linear_attention = True
-        specs = (_spec("qsa", AttnType.QSA, index_head_dim=128),)
+        specs = (_spec("full", AttnType.QSA, index_head_dim=128, index_ratio=4),)
     elif kind == "linear_hybrid":
         mc.has_linear_attention = True
         specs = (_spec("full", AttnType.FULL),)
@@ -112,7 +115,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
         ("dsa", "dsa"),  # MLA + DSA indexer (GLM-5.2 shape)
         ("dsv4", "dsv4_sparse"),
         ("bsa", "m3_sparse"),  # MiniMax-M3 block-sparse GQA
-        ("qsa", "qsa"),  # Qwen4 compressed sparse GQA
+        ("qsa", "qsa_sparse"),  # Qwen3.8-Flash-Next compressed-block sparse
     ],
 )
 def test_auto_resolves_per_type(monkeypatch, kind, expected):
@@ -135,15 +138,6 @@ def test_auto_bsa_sets_block_page_size(monkeypatch):
     assert config.page_size == 128
 
 
-def test_auto_qsa_sets_aligned_page_size(monkeypatch):
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_env(monkeypatch)
-    config = _config("qsa", attention_backend="auto")
-    _adjust_config(config)
-    assert config.page_size == 64
-
-
 def test_bsa_rejects_float32_dtype(monkeypatch):
     # --dtype float32 used to pass config validation and die on the pool's
     # itemsize==2 assert only after the model was resident.
@@ -151,6 +145,39 @@ def test_bsa_rejects_float32_dtype(monkeypatch):
 
     _patch_env(monkeypatch)
     config = _config("bsa", attention_backend="auto")
+    object.__setattr__(config, "dtype", torch.float32)
+    with pytest.raises(ValueError, match="16-bit"):
+        _adjust_config(config)
+
+
+def test_auto_qsa_sets_page_size_64(monkeypatch):
+    # qsa_sparse registers page_sizes=(64,) (a 4-token compress group must never straddle
+    # a page); the generic backend page-size coercion takes the default 1 to 64.
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto")
+    assert config.page_size == 1
+    _adjust_config(config)
+    assert config.page_size == 64
+
+
+def test_qsa_coerces_explicit_page_size(monkeypatch):
+    # Same policy as m3_sparse (page_sizes=(128,)): an unsupported explicit value is
+    # coerced to the backend's page size with a warning, not rejected.
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto", page_size=16)
+    _adjust_config(config)
+    assert config.page_size == 64
+
+
+def test_qsa_rejects_float32_dtype(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("qsa", attention_backend="auto")
     object.__setattr__(config, "dtype", torch.float32)
     with pytest.raises(ValueError, match="16-bit"):
         _adjust_config(config)
@@ -172,13 +199,17 @@ def test_auto_dsv4_sets_window_page_size(monkeypatch):
         ("full", "dsa"),
         ("full", "dsv4_sparse"),
         ("full", "m3_sparse"),
-        ("full", "qsa"),
         ("swa", "dsa"),
+        ("full", "qsa_sparse"),
         # forward gates: generic backends on the BSA-locked model
         ("bsa", "fi"),
         ("bsa", "triton"),
+        # forward gates: generic and neighbouring sparse backends on the QSA-locked model
         ("qsa", "fi"),
+        ("qsa", "fa"),
         ("qsa", "triton"),
+        ("qsa", "m3_sparse"),
+        ("bsa", "qsa_sparse"),
         # forward gates: generic backends on type-locked models
         ("mla", "fi"),
         ("mla", "triton"),
@@ -212,10 +243,10 @@ def test_illegal_combinations_rejected_at_config_time(monkeypatch, kind, backend
         ("mla", "dsa"),
         ("dsa", "dsa"),
         ("dsv4", "dsv4_sparse"),
+        ("qsa", "qsa_sparse"),
         ("swa", "triton"),
         ("full", "triton"),
         ("full", "fa,fi"),
-        ("qsa", "qsa"),
     ],
 )
 def test_legal_explicit_combinations_pass(monkeypatch, kind, backend):
@@ -235,47 +266,6 @@ def test_mla_requires_page_size_one(monkeypatch, kind):
     config = _config(kind, attention_backend="auto", page_size=16)
     with pytest.raises(ValueError, match="page-size 1"):
         _adjust_config(config)
-
-
-def test_hybrid_linear_opt_out_rejects_backend(monkeypatch):
-    import dataclasses
-
-    from freetoken.attention import attention_backend_info
-    from freetoken.engine import engine
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_env(monkeypatch)
-    real_info = attention_backend_info
-
-    def _info(name):
-        info = real_info(name)
-        return dataclasses.replace(info, hybrid_linear_ok=False) if name == "fa" else info
-
-    monkeypatch.setattr(engine, "attention_backend_info", _info)
-    # auto skips the opted-out backend ...
-    config = _config("linear_hybrid", attention_backend="auto")
-    _adjust_config(config)
-    assert config.attention_backend == "fi"
-    # ... and an explicit choice of it is rejected
-    config = _config("linear_hybrid", attention_backend="fa")
-    with pytest.raises(ValueError, match="hybrid-linear"):
-        _adjust_config(config)
-
-
-def test_model_runtime_capabilities_force_safe_cache_and_graph(monkeypatch):
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_env(monkeypatch)
-    config = _config("linear_hybrid", attention_backend="auto")
-    object.__setattr__(config, "cache_type", "radix")
-    config.model_config.requires_naive_cache = True
-    config.model_config.supports_cuda_graph = False
-
-    _adjust_config(config)
-
-    assert config.cache_type == "naive"
-    assert config.cuda_graph_bs == []
-    assert config.cuda_graph_max_bs == 0
 
 
 def test_trtllm_page_size_coercion_is_part_aware(monkeypatch):
@@ -405,3 +395,10 @@ def dataclasses_replace_groups(mc, groups):
     import dataclasses
 
     return dataclasses.replace(mc, attention_groups=groups)
+
+
+def test_linear_attention_defaults_to_hybrid_radix():
+    from freetoken.engine.engine import _resolve_cache_type
+
+    assert _resolve_cache_type(True, "radix") == "hybrid_radix"
+    assert _resolve_cache_type(True, "naive") == "naive"

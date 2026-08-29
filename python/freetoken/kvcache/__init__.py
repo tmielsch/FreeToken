@@ -57,14 +57,14 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .dsa_pool import MLAKVCache
 
         return MLAKVCache
-    if AttnType.BSA in types:
-        from .bsa_pool import BSAKVCache
-
-        return BSAKVCache
     if AttnType.QSA in types:
         from .qsa_pool import QSAKVCache
 
         return QSAKVCache
+    if AttnType.BSA in types:
+        from .bsa_pool import BSAKVCache
+
+        return BSAKVCache
     from .mha_pool import MHAKVCache
 
     return MHAKVCache
@@ -110,6 +110,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
     )
 
 
@@ -120,6 +121,7 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
     num_swa_tokens: int | None = None,
+    num_req_slots: int | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -178,10 +180,16 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
         )
 
+    # QSA (Qwen3.8-Flash-Next): the same GQA group, but it stores one index key per
+    # index_ratio tokens and adds per-request tiers sized by the concurrency, not the pages.
+    # layer_ids is mandatory here -- the model is hybrid-linear, and letting MHAKVCache back
+    # all num_layers would allocate K/V slabs for the GDN layers too.
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.QSA:
         from .qsa_pool import QSAKVCache
 
         spec = kv_specs[0]
+        if num_req_slots is None:
+            raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -190,9 +198,10 @@ def create_kvcache_pool(
             page_size=page_size,
             dtype=dtype,
             device=device,
-            index_num_kv_heads=spec.index_num_kv_heads,
             index_head_dim=spec.index_head_dim,
-            compress_ratio=spec.index_compress_ratio,
+            num_index_layers=spec.num_index_layers,
+            index_ratio=spec.index_ratio,
+            num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
         )
 

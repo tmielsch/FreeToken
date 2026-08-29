@@ -1,10 +1,12 @@
-"""Host-mmap PLE embedding for Qwen3.8 Flash Next GGUF.
+"""Host-mmapped PLE n-gram table for Qwen3.8 Flash Next GGUF checkpoints.
 
 The GGUF stores the complete n-gram hash table as one enormous quantized tensor
 (``per_layer_token_embd.weight``).  It must never be materialized or copied as a
-whole.  ``GGUFReader`` exposes quantized tensor payloads as NumPy views over its
-file memmap; this adapter keeps that view alive, gathers only the rows requested
-by the current token batch, and dequantizes those tiny row batches on the GPU.
+whole: ``GGUFReader`` exposes quantized tensor payloads as NumPy views over its
+file memmap.  This backend implements ``ple.PLETableBackend`` on top of that
+view -- it gathers only the rows requested by the current token batch into a tiny
+pinned staging buffer and dequantizes those few rows on the GPU, so the
+multi-GiB source stays file-backed.
 """
 
 from __future__ import annotations
@@ -18,13 +20,9 @@ from freetoken.models.gguf.dequant import (
     GGML_BF16,
     GGML_F16,
     GGML_F32,
-    GGML_NAME,
     GGML_UNQUANTIZED,
     row_bytes,
 )
-
-from .model import _HostNGramEmbedding
-
 
 _DTYPE_FOR_GGML = {
     GGML_F32: torch.float32,
@@ -42,77 +40,47 @@ def _long_tuple(value) -> tuple[int, ...]:
         return (int(value),)
 
 
-class GGUFHostNGramEmbedding(_HostNGramEmbedding):
-    """Drop-in PLE embedding whose hash-table rows stay in the GGUF file mmap."""
+class GGUFPLETableBackend:
+    """``PLETableBackend`` whose packed rows stay in the GGUF file mmap.
 
-    def __init__(self, config, layer_id: int, quant_type: int):
-        super().__init__(config, layer_id)
+    ``lookup(row_ids, out)`` index-selects the packed rows on the CPU (zero-copy
+    view, piped through a small pinned staging buffer), then dequantizes on
+    ``row_ids.device``.  ``out`` is optional -- giving it reuses the graph buffer
+    exactly like ``PinnedUVATable``.  The required-row bound and per-head
+    constants come from the same ``qwen4exp.ple.*`` metadata the resident
+    iterator feeds ``NGramEmbedding``.
+    """
 
-        # In the HF checkpoint these are ordinary tensors and therefore public
-        # state_dict entries. llama.cpp moves them into GGUF metadata instead.
-        # Remove the public placeholders so BaseOP does not demand nonexistent
-        # tensor weights; load_host_weights installs private CPU constants.
-        del self.layer_multipliers
-        del self.ngram_heads_vocab_sizes
-        del self.ngram_heads_offsets
-
-        self._quant_type = int(quant_type)
-        self._packed_rows: torch.Tensor | None = None
-        self._row_bytes = row_bytes(self.head_dim, self._quant_type)
-        self._row_count = 0
-        self._readers: list[object] = []
-
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        if dummy:
-            self._dummy = True
-            return
-
+    def __init__(self, model_path: str, args) -> None:
         import gguf
 
-        from freetoken.models.gguf.reader import (
-            gguf_config_source,
-            gguf_split_paths,
-            load_gguf_metadata,
-        )
+        from .gguf_weights import gguf_ngram_constants
+        from freetoken.models.gguf.reader import gguf_config_source, gguf_split_paths
+
+        self.num_rows = 0
+        self.head_dim = args.ngram_head_dim
+        self.dtype = torch.bfloat16
 
         source = gguf_config_source(model_path)
         if source is None:
             raise ValueError(f"cannot resolve Qwen4Exp GGUF source from {model_path}")
 
-        metadata = load_gguf_metadata(source)
-
-        def meta(name: str):
-            key = f"qwen4exp.ple.{name}"
-            if key not in metadata:
-                raise KeyError(f"Qwen4Exp GGUF is missing PLE metadata {key}")
-            return metadata[key]
-
-        multipliers = torch.tensor(
-            _long_tuple(meta("layer_multipliers")), dtype=torch.long
-        )
-        vocab_sizes = torch.tensor(
-            _long_tuple(meta("head_vocab_sizes")), dtype=torch.long
-        )
-        offsets = torch.tensor(
-            _long_tuple(meta("head_offsets")), dtype=torch.long
-        )
-
-        expected_heads = self.ngram_heads
-        if multipliers.numel() != self.ngram_size:
+        multipliers, vocab_sizes, offsets = gguf_ngram_constants(model_path)
+        expected_heads = args.num_ngram_heads
+        if len(multipliers) != args.ngram_size:
             raise ValueError(
-                f"PLE has {multipliers.numel()} layer multipliers, "
-                f"expected {self.ngram_size}"
+                f"PLE has {len(multipliers)} layer multipliers, expected {args.ngram_size}"
             )
-        if vocab_sizes.numel() != expected_heads or offsets.numel() != expected_heads:
+        if len(vocab_sizes) != expected_heads or len(offsets) != expected_heads:
             raise ValueError(
-                f"PLE has {vocab_sizes.numel()} vocab sizes / {offsets.numel()} offsets, "
+                f"PLE has {len(vocab_sizes)} vocab sizes / {len(offsets)} offsets, "
                 f"expected {expected_heads} each"
             )
-        self._host_constants = (multipliers, vocab_sizes, offsets)
+        required_rows = int(offsets[-1] + vocab_sizes[-1])
 
         found = None
-        found_reader = None
         readers = []
+        quant_type = None
         for path in gguf_split_paths(source):
             reader = gguf.GGUFReader(path, mode="c")
             readers.append(reader)
@@ -124,18 +92,14 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
                         "duplicate per_layer_token_embd.weight across GGUF shards"
                     )
                 found = tensor
-                found_reader = reader
 
         if found is None:
             raise RuntimeError(
                 "Qwen4Exp GGUF has PLE metadata but no per_layer_token_embd.weight"
             )
-        if int(found.tensor_type) != self._quant_type:
-            raise ValueError(
-                "PLE table quant type changed after model construction: "
-                f"{GGML_NAME.get(self._quant_type, self._quant_type)} -> "
-                f"{getattr(found.tensor_type, 'name', int(found.tensor_type))}"
-            )
+        quant_type = int(found.tensor_type)
+        self._quant_type = quant_type
+        self._row_bytes = row_bytes(self.head_dim, quant_type)
 
         ne = [int(v) for v in found.shape]  # ggml order: [row_dim, rows]
         if len(ne) != 2 or ne[0] != self.head_dim:
@@ -173,71 +137,33 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
             )
 
         # Zero-copy CPU tensor over the file mmap. It is read-only in practice;
-        # forward only index_selects from it.
+        # lookup only index_selects from it.
         self._packed_rows = torch.from_numpy(packed_np)
-        self._row_count = rows
+        self.num_rows = rows
         # Keep all readers alive so the memmap backing the selected tensor remains valid.
         self._readers = readers
-        assert found_reader is not None
 
-        required_rows = int(offsets[-1] + vocab_sizes[-1])
-        if self._row_count < required_rows:
+        if self.num_rows < required_rows:
             raise RuntimeError(
-                f"PLE table has {self._row_count} rows, metadata needs {required_rows}"
+                f"PLE table has {self.num_rows} rows, metadata needs {required_rows}"
             )
 
-    def forward(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self._dummy:
-            from freetoken.core import get_global_ctx
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        # CPU-side gather; staging happens in lookup. Kept for protocol symmetry.
+        return None
 
-            token_count = get_global_ctx().batch.input_ids.numel()
-            return torch.zeros(
-                token_count, self.embedding_dim, device=device, dtype=dtype
-            )
-        if self._packed_rows is None or self._host_constants is None:
-            raise RuntimeError("Qwen4Exp GGUF PLE host weights are not loaded")
-        if os.path.exists(r"D:\temp\opencode\ft_zero_ple.flag"):
-            from freetoken.core import get_global_ctx
-            return torch.zeros(
-                get_global_ctx().batch.input_ids.numel(),
-                self.embedding_dim, device=device, dtype=dtype,
-            )
-
-        ids = self._current_ngram_ids().reshape(-1)
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        ids = row_ids.reshape(-1)
         if ids.numel() == 0:
-            return torch.empty(
-                0, self.embedding_dim, device=device, dtype=dtype
-            )
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-            try:
-                from freetoken.core import get_global_ctx
-                from freetoken.utils.logger import init_logger
-                _log = init_logger("freetoken.qwen4exp.ple")
-                _batch = get_global_ctx().batch
-                _reqs = _batch.padded_reqs if _batch.is_decode else getattr(_batch, "reqs", None) or _batch.padded_reqs
-                _tok_tail = []
-                _req_tail = []
-                for r in (_reqs or []):
-                    _ids_t = r.input_ids
-                    _tok_tail.append(_ids_t[-3:].tolist() if _ids_t.numel() else [])
-                    _req_tail.append((r.uid, r.cached_len, r.device_len))
-                _nids = ids.numel()
-                _head_ids = ids[-3:].tolist() if _nids else []
-                _span = (int(ids.min()), int(ids.max()))
-                _log.info(
-                    "GGUF_PLE layer=%d n=%d ngram_ids_tail=%s tok_ids_tail=%s span=%s reqs=%s",
-                    self.layer_id, _nids, _head_ids, str(_tok_tail), _span, str(_req_tail),
-                )
-            except Exception:  # pragma: no cover
-                pass
+            return torch.empty(0, self.head_dim, device=row_ids.device, dtype=self.dtype)
         lo, hi = int(ids.min()), int(ids.max())
-        if lo < 0 or hi >= self._row_count:
+        if lo < 0 or hi >= self.num_rows:
             raise IndexError(
-                f"PLE row id range [{lo}, {hi}] outside [0, {self._row_count})"
+                f"PLE row id range [{lo}, {hi}] outside [0, {self.num_rows})"
             )
 
         # Gather into a tiny pinned staging buffer: 16 rows/token * 90 bytes/row
-        # for the current IQ4_NL model. The 28.8 GiB source remains file-backed.
+        # for the current IQ4_NL model. The ~29 GiB source remains file-backed.
         staging = torch.empty(
             (ids.numel(), self._row_bytes),
             dtype=torch.uint8,
@@ -245,18 +171,33 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
         )
         torch.index_select(self._packed_rows, 0, ids, out=staging)
 
+        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+            try:
+                from freetoken.utils.logger import init_logger
+
+                _log = init_logger("freetoken.qwen4exp.ple")
+                _nids = ids.numel()
+                _head_ids = ids[-3:].tolist() if _nids else []
+                _span = (lo, hi)
+                _log.info(
+                    "GGUF_PLE n=%d ngram_ids_tail=%s span=%s",
+                    _nids, str(_head_ids), _span,
+                )
+            except Exception:  # pragma: no cover
+                pass
+
         if self._quant_type in GGML_UNQUANTIZED:
             raw_dtype = _DTYPE_FOR_GGML[self._quant_type]
-            values = staging.view(raw_dtype).to(device=device, dtype=dtype)
+            values = staging.view(raw_dtype).to(device=row_ids.device, dtype=self.dtype)
         else:
-            if device.type != "cuda":
+            if row_ids.device.type != "cuda":
                 raise RuntimeError(
                     "Qwen4Exp GGUF PLE quantized rows currently require CUDA dequantization"
                 )
             from freetoken.kernel.gguf import ggml_dequantize
 
             packed = staging.to(
-                device=device,
+                device=row_ids.device,
                 non_blocking=staging.is_pinned(),
             )
             values = ggml_dequantize(
@@ -264,22 +205,14 @@ class GGUFHostNGramEmbedding(_HostNGramEmbedding):
                 self._quant_type,
                 ids.numel(),
                 self.head_dim,
-                dtype,
+                self.dtype,
             )
 
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-            try:
-                tail = values[-3:].float() if values.shape[0] >= 3 else values.float()
-                from freetoken.utils.logger import init_logger
-                _log = init_logger("freetoken.qwen4exp.ple")
-                _log.info(
-                    "GGUF_PLEV layer=%d tail_norms=%s",
-                    self.layer_id, [round(float(x), 4) for x in tail.norm(dim=-1).tolist()],
-                )
-            except Exception:  # pragma: no cover
-                pass
-
-        return values.reshape(-1, self.embedding_dim)
+        values = values.reshape(*row_ids.shape[:-1], -1)
+        if out is None:
+            return values
+        out.copy_(values)
+        return out
 
 
-__all__ = ["GGUFHostNGramEmbedding"]
+__all__ = ["GGUFPLETableBackend"]

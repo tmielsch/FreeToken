@@ -48,7 +48,7 @@ def default_cache_size_for_custom_factory(config) -> int:
     """Slot-count default when a model-owned ``make_offload_moe_cache`` meets an
     unresolved ``--moe-cache-auto`` (e.g. the desktop app's no-sizing-flag start).
     Auto sizing works on bytes against the engine-managed slot arena, but the
-    custom factory builds its own cache from ``moe_cache_size`` directly — so the
+    custom factory builds its own cache from ``moe_cache_size`` directly, so the
     safe floor is exactly one slot per expert (``validate_rebuild``'s minimum)."""
     return config.model_config.num_experts
 
@@ -123,9 +123,7 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(
-    required: frozenset[AttnType], hybrid_linear: bool
-) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -138,7 +136,7 @@ def _resolve_auto_attention_backend(
     if AttnType.BSA in required:
         candidates.append(("m3_sparse", True))
     if AttnType.QSA in required:
-        candidates.append(("qsa", True))
+        candidates.append(("qsa_sparse", True))
     if AttnType.SWA in required:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
@@ -152,10 +150,6 @@ def _resolve_auto_attention_backend(
         if not arch_ok:
             continue
         if not _backend_parts_serve(name, required):
-            continue
-        if hybrid_linear and not all(
-            attention_backend_info(p).hybrid_linear_ok for p in name.split(",")
-        ):
             continue
         if not _backend_requirements_met(name):
             continue
@@ -188,8 +182,8 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             valid = [
                 name
                 for name in (
-                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse",
-                    "m3_sparse", "qsa",
+                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse",
+                    "qsa_sparse",
                 )
                 if required <= attention_backend_info(name).supported_types
             ]
@@ -198,11 +192,6 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"{getattr(model_config, 'model_type', 'model')} uses {missing_names} "
                 f"attention, which backend {part!r} does not support; valid backends: "
                 f"{', '.join(valid)} (or auto), got {config.attention_backend!r}."
-            )
-        if getattr(model_config, "has_linear_attention", False) and not info.hybrid_linear_ok:
-            raise ValueError(
-                f"backend {part!r} does not support hybrid-linear (GDN/mamba) models, "
-                f"got {config.attention_backend!r}."
             )
         if AttnType.SWA in required and not info.consumes_attn_spec:
             # SWA models drive window/sinks/sm_scale through the per-call AttentionSpec;
@@ -337,11 +326,6 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        if hasattr(self.model, "load_host_weights"):
-            self.model.load_host_weights(
-                config.model_path,
-                dummy=config.use_dummy_weight,
-            )
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -352,6 +336,12 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
+        # load failure is not masked, before the MoE offload cache so the bank residency
+        # planning sees the pin quota the table already spent.
+        self._host_tables_bytes = 0
+        if hasattr(self.model, "load_host_tables"):
+            self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -380,6 +370,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
+                slot_states=config.model_config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
@@ -546,9 +537,11 @@ class Engine:
             not cpu_layer_ids
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes() is not None
+            and _pin_budget_bytes(self._host_tables_bytes) is not None
         ):
-            cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
+            cpu_layer_ids = _auto_cpu_layers(
+                config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
+            )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -561,13 +554,13 @@ class Engine:
         split_residency = (
             bool(cpu_layer_ids)
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes() is not None
+            and _pin_budget_bytes(self._host_tables_bytes) is not None
         )
         if config.moe_backend == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-            budget = _pin_budget_bytes()
+            budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
@@ -956,28 +949,6 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        debug_on = os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag")
-        if getattr(self, "_debug_logits", False) or debug_on:
-            try:
-                float_logits = batch_logits.float()
-                top = torch.topk(float_logits, min(10, batch_logits.shape[-1]), dim=-1)
-                logsum = torch.logsumexp(float_logits, dim=-1)
-                for r_i, req in enumerate(batch.reqs[: batch.size]):
-                    ids = top.indices[r_i].tolist()
-                    logv = top.values[r_i].tolist()
-                    probs = [float(2.718281828 ** (min(lv - float(logsum[r_i]), 0.0))) for lv in logv]
-                    try:
-                        tail = req.input_ids[-6:].tolist() if req.input_ids.numel() else []
-                        ntok = req.input_ids.numel()
-                    except Exception:
-                        tail, ntok = [], -1
-                    logger.info(
-                        "DEBUGA row=%d uid=%d decode=%s cl=%d dl=%d ntok=%d tail=%s max=%d top10=%s probs=%s",
-                        r_i, req.uid, batch.is_decode, req.cached_len, req.device_len,
-                        ntok, tail, ids[0], ids, [round(p, 5) for p in probs],
-                    )
-            except Exception:  # pragma: no cover
-                pass
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -1208,61 +1179,20 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
-def _pin_budget_bytes() -> int | None:
-    """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+def _pin_budget_bytes(reserved: int = 0) -> int | None:
+    """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    Native Windows and WSL both use WDDM-backed CUDA, which caps registered host
-    memory near half of physical RAM and shares that pool across processes. Keep
-    20% headroom by budgeting 40%. ``FREETOKEN_PIN_BUDGET_GB`` overrides this on
-    every platform."""
+    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        return int(float(env) * 2**30)
-
-    if os.name == "nt":
-        total = _windows_total_physical_memory()
-        return int(total * 0.4) if total is not None else None
-
-    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():
+        cap = int(float(env) * 2**30)
+    elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
         return None
-    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+    else:
+        cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
+    return max(0, cap - reserved)
 
 
-def _windows_total_physical_memory() -> int | None:
-    """Return native-Windows physical RAM through ``GlobalMemoryStatusEx``.
-
-    This stays stdlib-only because the server must make the pin-budget decision
-    before optional monitoring packages are available. ``None`` is a defensive
-    fallback for an unexpected Win32 API failure; callers then retain the old
-    explicit-override behavior through ``FREETOKEN_PIN_BUDGET_GB``.
-    """
-    if os.name != "nt":
-        return None
-
-    import ctypes
-
-    class _MemoryStatusEx(ctypes.Structure):
-        _fields_ = [
-            ("dwLength", ctypes.c_ulong),
-            ("dwMemoryLoad", ctypes.c_ulong),
-            ("ullTotalPhys", ctypes.c_ulonglong),
-            ("ullAvailPhys", ctypes.c_ulonglong),
-            ("ullTotalPageFile", ctypes.c_ulonglong),
-            ("ullAvailPageFile", ctypes.c_ulonglong),
-            ("ullTotalVirtual", ctypes.c_ulonglong),
-            ("ullAvailVirtual", ctypes.c_ulonglong),
-            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-        ]
-
-    status = _MemoryStatusEx()
-    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
-    try:
-        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-    except (AttributeError, OSError):
-        return None
-    return int(status.ullTotalPhys) if ok else None
-
-
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
+def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
@@ -1271,7 +1201,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
     if not bank_bytes:
         return frozenset()
-    budget = _pin_budget_bytes()
+    budget = _pin_budget_bytes(reserved)
     if budget is None or bank_bytes <= budget:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):
@@ -1313,8 +1243,6 @@ def _adjust_config(config: EngineConfig):
 
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
-    requires_naive_cache = getattr(model_config, "requires_naive_cache", False)
-    supports_cuda_graph = getattr(model_config, "supports_cuda_graph", True)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
@@ -1354,14 +1282,6 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 
-    if not supports_cuda_graph:
-        override("cuda_graph_bs", [])
-        override("cuda_graph_max_bs", 0)
-        logger.info_rank0(
-            f"CUDA graphs disabled for {getattr(model_config, 'model_type', 'model')}: "
-            "the model requires host-side work during forward"
-        )
-
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
@@ -1384,14 +1304,6 @@ def _adjust_config(config: EngineConfig):
                 )
             override("cache_type", "swa_radix")
 
-    if requires_naive_cache and getattr(config, "cache_type", "radix") != "naive":
-        override("cache_type", "naive")
-        logger.warning_rank0(
-            f"Cache type overridden to 'naive' for "
-            f"{getattr(model_config, 'model_type', 'model')}: model-owned runtime state "
-            "cannot be restored from radix prefixes"
-        )
-
     if has_linear_attention:
         override(
             "cache_type",
@@ -1403,11 +1315,15 @@ def _adjust_config(config: EngineConfig):
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
-    if required_attn_types & {AttnType.BSA, AttnType.QSA} and _dtype is not None and _dtype.itemsize != 2:
-        # Reject at config time: the BSA pool's own assert only fires after the
+    if (
+        required_attn_types & {AttnType.BSA, AttnType.QSA}
+        and _dtype is not None
+        and _dtype.itemsize != 2
+    ):
+        # Reject at config time: the BSA/QSA pool's own assert only fires after the
         # model is resident (and not at all under `python -O`).
         raise ValueError(
-            f"--dtype {config.dtype}: sparse attention serves 16-bit "
+            f"--dtype {config.dtype}: block-sparse attention serves 16-bit "
             "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
             "or float16."
         )
@@ -1425,7 +1341,7 @@ def _adjust_config(config: EngineConfig):
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types, has_linear_attention),
+            _resolve_auto_attention_backend(required_attn_types),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

@@ -1,855 +1,187 @@
+"""Qwen3.8-Flash-Next decoder stack (text-only).
+
+The residual state is ``R [T, hc_count*hidden]`` end to end: the embedding is repeated over the
+``hc_count`` streams, every layer mixes them down to one ``[T, hidden]`` block input and injects
+its output back, and the top-level mixer collapses them once before ``lm_head``. There is no
+input/post layernorm and no final ``model.norm`` -- the hyper-connection norms are the only ones.
+
+Layer contract (frozen): ``forward(R [T, hc*hidden], batch) -> R' [T, hc*hidden]`` with an
+immediate combine::
+
+    R  = R + ple(R, batch)                 # zero-based layer 1 only
+    x, s = attn_hc.mix(R); y = (GDN | QSA)(x); R = attn_hc.combine(R, y, s)
+    x, s = mlp_hc.mix(R);  y = MoE(x);        R = mlp_hc.combine(R, y, s)
+"""
+
 from __future__ import annotations
 
-import json
-import math
-import os
-from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
-import safetensors
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.layers import (
-    BaseOP,
-    GemmaPlusOneRMSNorm,
-    LinearColParallelMerged,
-    LinearReplicated,
-    LinearRowParallel,
-    OPList,
-    ParallelLMHead,
-    VocabParallelEmbedding,
-    make_moe_layer,
-    silu_and_mul,
-    StateLessOP,
-    get_rope,
-)
+from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
-from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
-from freetoken.utils import download_hf_weight, nvtx_annotate
+from freetoken.utils import nvtx_annotate
+
+from .attention import Qwen4ExpAttention
+from .hc import GatedResidual
+from .moe import Qwen4ExpMoE
+from .ple import PLELayer
 
 if TYPE_CHECKING:
+    from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
 
-    from .args import Qwen4ExpArgs
 
-
-def _layerdbg(tag: str, layer_id: int, t: torch.Tensor) -> None:
-    if not os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-        return
-    try:
-        f = t.float()
-        mx = float(f.norm(dim=-1).max())
-        bad = torch.isinf(f) | torch.isnan(f)
-        if bool(bad.any()):
-            bad_rows = bad.any(dim=-1)
-            rows = int(bad_rows.sum())
-            first = int(bad_rows.nonzero()[0].min()) if rows else -1
-            from freetoken.utils import init_logger
-
-            logger = init_logger("freetoken.qwen4exp.layerdbg")
-            logger.warning(
-                "LAYERDBG layer=%s tag=%s maxnorm=%.4g inf=%s nan=%s poisoned_rows=%s first_bad_row=%s",
-                layer_id, tag, mx, bool(torch.isinf(f).any()), bool(torch.isnan(f).any()),
-                rows, first,
-            )
-    except Exception:
-        pass
-
-
-class _Qwen4MRoPE(StateLessOP):
-    """Partial, interleaved temporal/height/width RoPE for Qwen4-Exp."""
-
-    def __init__(self, config: ModelConfig):
-        rotary = config.rotary_config
-        self._base = get_rope(
-            head_dim=rotary.head_dim,
-            rotary_dim=rotary.rotary_dim,
-            max_position=rotary.max_position,
-            base=rotary.base,
-        )
-        self.mrope_section = tuple(config.qwen4_args.mrope_section)
-
-    @property
-    def head_size(self) -> int:
-        return self._base.head_size
-
-    @property
-    def rotary_dim(self) -> int:
-        return self._base.rotary_dim
-
-    @property
-    def is_neox(self) -> bool:
-        return self._base.is_neox
-
-    @property
-    def _cos_sin_cache(self) -> torch.Tensor:
-        return self._base._cos_sin_cache
-
-    @_cos_sin_cache.setter
-    def _cos_sin_cache(self, value: torch.Tensor) -> None:
-        self._base._cos_sin_cache = value
-
-    def apply_inplace(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        head_size: int | None = None,
-    ) -> None:
-        head_size = self.head_size if head_size is None else int(head_size)
-        if positions.ndim == 1:
-            self._base.apply_rope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=head_size,
-                cos_sin_cache=self._cos_sin_cache,
-                is_neox=self.is_neox,
-            )
-            return
-        if query.is_cuda:
-            from freetoken.kernel.triton.rope import (
-                apply_mrope_with_cos_sin_cache_inplace,
-            )
-
-            apply_mrope_with_cos_sin_cache_inplace(
-                positions=positions,
-                query=query,
-                key=key,
-                head_size=head_size,
-                cos_sin_cache=self._cos_sin_cache,
-                mrope_section=self.mrope_section,
-                is_neox=self.is_neox,
-            )
-            return
-
-        # CPU reference path for exact unit tests and configuration checks.
-        if positions.ndim != 2 or positions.shape != (3, query.shape[0]):
-            raise ValueError(
-                f"MRoPE positions must have shape (3, {query.shape[0]}), got "
-                f"{tuple(positions.shape)}"
-            )
-        half = self.rotary_dim // 2
-        pair = torch.arange(half, device=positions.device)
-        axis = torch.zeros(half, dtype=torch.long, device=positions.device)
-        axis[(pair % 3 == 1) & (pair < self.mrope_section[1] * 3)] = 1
-        axis[(pair % 3 == 2) & (pair < self.mrope_section[2] * 3)] = 2
-        selected = positions.long().transpose(0, 1)[:, axis]
-        dim = pair.view(1, -1).expand_as(selected)
-        cos = self._cos_sin_cache[:, :half][selected, dim]
-        sin = self._cos_sin_cache[:, half:][selected, dim]
-        for tensor in (query, key):
-            heads = tensor.shape[1] // head_size
-            view = tensor.view(tensor.shape[0], heads, head_size)
-            first = view[..., :half].float().clone()
-            second = view[..., half : self.rotary_dim].float().clone()
-            view[..., :half].copy_((first * cos[:, None] - second * sin[:, None]).to(view.dtype))
-            view[..., half : self.rotary_dim].copy_(
-                (second * cos[:, None] + first * sin[:, None]).to(view.dtype)
-            )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.apply_inplace(positions, query, key)
-        return query, key
-
-
-class _GroupedRMSNorm(BaseOP):
-    def __init__(self, size: int, group_size: int, eps: float):
-        if size % group_size:
-            raise ValueError(f"RMSNorm size {size} is not divisible by group size {group_size}")
-        self.weight = torch.empty(size)
-        self.group_size = group_size
-        self.eps = eps
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.fla import rms_norm_gated
-
-        return rms_norm_gated(
-            x=hidden,
-            weight=self.weight,
-            bias=None,
-            eps=self.eps,
-            group_size=self.group_size,
-            is_rms_norm=True,
-            weight_plus_one=True,
-        )
-
-
-class _GatedRMSNorm(BaseOP):
-    def __init__(self, size: int, eps: float, activation: str):
-        self.weight = torch.empty(size)
-        self.eps = eps
-        self.activation = activation
-
-    def forward(self, hidden: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.fla import rms_norm_gated
-
-        return rms_norm_gated(
-            x=hidden,
-            weight=self.weight,
-            bias=None,
-            z=gate,
-            eps=self.eps,
-            is_rms_norm=True,
-            norm_before_gate=True,
-            activation=self.activation,
-        )
-
-
-class _GatedResidual(BaseOP):
-    def __init__(self, config: ModelConfig, combine: bool = True):
-        args: Qwen4ExpArgs = config.qwen4_args
-        self._dbg_name = "hc"
-        self.hc_count = args.hc_count
-        self.hidden_size = config.hidden_size
-        hc_size = self.hc_count * self.hidden_size
-        self.hc_norm = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.input_mix_weight_down = LinearReplicated(hc_size, args.hc_lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(args.hc_lowrank, hc_size, has_bias=False)
-        self.block_inject_weight = (
-            LinearReplicated(hc_size, self.hc_count, has_bias=False) if combine else None
-        )
-
-    def forward(self, hyper_input: torch.Tensor):
-        _layerdbg(f"{self._dbg_name}.in", -1, hyper_input)
-        normalized = self.hc_norm.forward(hyper_input)
-        _layerdbg(f"{self._dbg_name}.norm", -1, normalized)
-        down_out = self.input_mix_weight_down.forward(normalized)
-        _layerdbg(f"{self._dbg_name}.down", -1, down_out)
-        mix = F.silu(down_out / self.hc_count)
-        up_out = self.input_mix_weight_up.forward(mix)
-        _layerdbg(f"{self._dbg_name}.up", -1, up_out)
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag") and self._dbg_name == "L8attnHC":
-            try:
-                from freetoken.utils import init_logger
-
-                lg = init_logger("freetoken.qwen4exp.layerdbg")
-                mm = mix.float()
-                dd = down_out.float()
-                nn = normalized.float()
-                hh = hyper_input.float()
-                lg.warning(
-                    "L8UPSUMM in_max=%.4g norm_max=%.4g down_max=%.4g mix_max=%.4g mix_contig=%s mix_shape=%s up_max=%.4g",
-                    float(hh.abs().max()), float(nn.abs().max()), float(dd.abs().max()),
-                    float(mm.abs().max()), mix.is_contiguous(), tuple(mix.shape),
-                    float(up_out.float().abs().max()),
-                )
-            except Exception:
-                pass
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-            try:
-                uf = up_out.float()
-                if bool((torch.isnan(uf) | torch.isinf(uf)).any()):
-                    from freetoken.utils import init_logger
-
-                    lg = init_logger("freetoken.qwen4exp.layerdbg")
-                    for wn, wobj in (
-                        ("mix_dn", self.input_mix_weight_down),
-                        ("mix_up", self.input_mix_weight_up),
-                    ):
-                        w = getattr(wobj, "qweight", None)
-                        if w is None:
-                            continue
-                        wf = w.float()
-                        lg.warning(
-                            "HCQWEIGHT %s name=%s id=%d shape=%s ptr=%d maxabs=%.4g nan=%s inf=%s x_ptr=%d down_ptr=%d up_ptr=%d",
-                            self._dbg_name, wn, id(wobj), tuple(w.shape), w.data_ptr(),
-                            float(wf.abs().max()), bool(torch.isnan(wf).any()),
-                            bool(torch.isinf(wf).any()), hyper_input.data_ptr(),
-                            down_out.data_ptr(), up_out.data_ptr(),
-                        )
-            except Exception:
-                pass
-        mix = torch.sigmoid(up_out)
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag") and (
-            bool(torch.isnan(mix.float()).any()) or bool(torch.isinf(mix.float()).any())
-        ):
-            try:
-                from freetoken.utils import init_logger
-
-                lg = init_logger("freetoken.qwen4exp.layerdbg")
-                for wn, w in (
-                    ("dn", self.input_mix_weight_down.weight),
-                    ("up", self.input_mix_weight_up.weight),
-                    ("hc", self.hc_norm.weight),
-                ):
-                    wf = w.float()
-                    lg.warning(
-                        "HCWEIGHT %s shape=%s ptr=%d maxabs=%.4g nan=%s inf=%s in_ptr=%d norm_ptr=%d down_ptr=%d",
-                        wn, tuple(w.shape), w.data_ptr(), float(wf.abs().max()),
-                        bool(torch.isnan(wf).any()), bool(torch.isinf(wf).any()),
-                        hyper_input.data_ptr(), normalized.data_ptr(), down_out.data_ptr(),
-                    )
-            except Exception:
-                pass
-        mix = mix.view(-1, self.hc_count, self.hidden_size)
-        mixed = (mix * normalized.view(-1, self.hc_count, self.hidden_size)).mean(dim=1)
-        _layerdbg(f"{self._dbg_name}.mixed", -1, mixed)
-        if self.block_inject_weight is None:
-            return mixed
-        inject = 2 * torch.sigmoid(self.block_inject_weight.forward(normalized) / self.hc_count)
-        _layerdbg(f"{self._dbg_name}.inject", -1, inject)
-        return mixed, hyper_input, inject
-
-
-class _SharedExpert(BaseOP):
-    def __init__(self, config: ModelConfig):
-        width = config.shared_expert_intermediate_size
-        self.gate_up_proj = LinearColParallelMerged(
-            config.hidden_size, [width, width], has_bias=False
-        )
-        self.down_proj = LinearRowParallel(width, config.hidden_size, has_bias=False)
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(hidden)))
-
-
-class _SparseMoE(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        weight_format = "fp8_block" if config.expert_quant == "fp8_block" else "bf16"
-        self.experts = make_moe_layer(
-            config,
-            layer_id=layer_id,
-            renormalize=bool(config.norm_topk_prob),
-            weight_format=weight_format,
-        )
-        self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        self.shared_expert = _SharedExpert(config)
-        self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        router_logits = self.gate.forward(hidden)
-        shared = self.shared_expert.forward(hidden)
-        shared *= torch.sigmoid(self.shared_expert_gate.forward(hidden))
-        return self.experts.forward(hidden_states=hidden, router_logits=router_logits) + shared
-
-
-def _shift_right_ignore_eos(tokens: torch.Tensor, shift: int, eos_token_id: int) -> torch.Tensor:
-    if shift == 0:
-        return tokens
-    positions = torch.arange(tokens.numel(), dtype=torch.long)
-    eos_positions = torch.where(tokens == eos_token_id, positions, -1)
-    previous_eos_inclusive = torch.cummax(eos_positions, dim=0).values
-    previous_eos = torch.cat([eos_positions.new_full((1,), -1), previous_eos_inclusive[:-1]])
-    segment_start = previous_eos + 1
-    source_positions = positions - shift
-    shifted = tokens[source_positions.clamp_min(0)]
-    valid = (positions - segment_start >= shift) & (source_positions >= 0)
-    return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
-
-
-def build_ngram_ids(
-    tokens: torch.Tensor,
-    *,
-    ngram_size: int,
-    heads_per_ngram: int,
-    eos_token_id: int,
-    multipliers: torch.Tensor,
-    vocab_sizes: torch.Tensor,
-    offsets: torch.Tensor,
-) -> torch.Tensor:
-    tokens = tokens.to(dtype=torch.long, device="cpu")
-    shifted = [
-        _shift_right_ignore_eos(tokens, shift, eos_token_id) for shift in range(ngram_size)
-    ]
-    blocks = []
-    for ngram in range(2, ngram_size + 1):
-        start = (ngram - 2) * heads_per_ngram
-        stop = start + heads_per_ngram
-        mixed = shifted[0] * multipliers[0]
-        for position in range(1, ngram):
-            mixed = torch.bitwise_xor(mixed, shifted[position] * multipliers[position])
-        sizes = vocab_sizes[start:stop]
-        heads = torch.remainder(mixed.unsqueeze(-1), sizes)
-        blocks.append(heads + offsets[start:stop])
-    return torch.cat(blocks, dim=-1)
-
-
-def _ple_request_tokens(req, forwarded_ids: torch.Tensor | None = None) -> torch.Tensor:
-    """Return the complete host token history visible to this forward.
-
-    The overlap scheduler advances ``device_len`` before it drains the prior
-    sampled token to ``req.input_ids``. During decode, that one current token is
-    already present in ``batch.input_ids``. Join it to the committed host prefix
-    so PLE hashes the same history as a non-overlapped forward.
-    """
-    host_len = req.input_ids.numel()
-    if host_len >= req.device_len:
-        return req.input_ids[: req.device_len]
-    if host_len != req.cached_len:
-        raise RuntimeError(
-            "Qwen4-Exp PLE host history has an unexpected gap: "
-            f"host={host_len}, cached={req.cached_len}, device={req.device_len}"
-        )
-    if forwarded_ids is None or forwarded_ids.numel() != req.extend_len:
-        actual = 0 if forwarded_ids is None else forwarded_ids.numel()
-        raise RuntimeError(
-            "Qwen4-Exp PLE needs the current forwarded tokens: "
-            f"got {actual}, expected {req.extend_len}"
-        )
-    return torch.cat((req.input_ids[: req.cached_len], forwarded_ids.to(device="cpu")))
-
-
-class _HostNGramEmbedding(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        args: Qwen4ExpArgs = config.qwen4_args
-        self.layer_id = layer_id
-        self.ngram_size = args.ngram_size
-        self.heads_per_ngram = args.heads_per_ngram
-        self.eos_token_id = args.eos_token_id
-        self.embedding_dim = args.ple_embed_dim
-        self.split_ngram_parts = args.split_ngram_parts
-        self.ngram_heads = (args.ngram_size - 1) * args.heads_per_ngram
-        self.head_dim = self.embedding_dim // self.ngram_heads
-        self.layer_multipliers = torch.empty(args.ngram_size, dtype=torch.long)
-        self.ngram_heads_vocab_sizes = torch.empty(self.ngram_heads, dtype=torch.long)
-        self.ngram_heads_offsets = torch.empty(self.ngram_heads, dtype=torch.long)
-        self._handles = []
-        self._shards: list[torch.Tensor] = []
-        self._shard_ends = torch.empty(0, dtype=torch.long)
-        self._scale = torch.tensor(1.0, dtype=torch.bfloat16)
-        self._host_constants: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        self._dummy = False
-
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        if dummy:
-            self._dummy = True
-            return
-        folder = download_hf_weight(model_path)
-        index_path = os.path.join(folder, "model.safetensors.index.json")
-        with open(index_path) as index_file:
-            weight_map = json.load(index_file)["weight_map"]
-        prefix = (
-            f"model.language_model.layers.{self.layer_id}.ple.ple_embedding."
-            "ngram_embedding"
-        )
-        shard_count = len([key for key in weight_map if key.startswith(prefix + ".shard_")])
-        if shard_count != self.split_ngram_parts:
-            raise RuntimeError(
-                f"Qwen4-Exp PLE has {shard_count} shards, expected {self.split_ngram_parts}"
-            )
-        shard_keys = [f"{prefix}.shard_{shard_id}.weight" for shard_id in range(shard_count)]
-        if not shard_keys or any(key not in weight_map for key in shard_keys):
-            raise RuntimeError(f"Incomplete Qwen4-Exp PLE shards under {prefix}")
-
-        handles = {}
-        shards = []
-        for key in shard_keys:
-            filename = weight_map[key]
-            handle = handles.get(filename)
-            if handle is None:
-                handle = safetensors.safe_open(
-                    os.path.join(folder, filename), framework="pt", device="cpu"
-                ).__enter__()
-                handles[filename] = handle
-            shard = handle.get_tensor(key)
-            if shard.dtype != torch.float8_e4m3fn or shard.shape[1] != self.head_dim:
-                raise RuntimeError(f"Unexpected PLE shard {key}: {shard.dtype} {tuple(shard.shape)}")
-            shards.append(shard.view(torch.uint8))
-        scale_key = prefix + ".weight_scale"
-        scale_handle = handles.get(weight_map[scale_key])
-        if scale_handle is None:
-            scale_handle = safetensors.safe_open(
-                os.path.join(folder, weight_map[scale_key]), framework="pt", device="cpu"
-            ).__enter__()
-            handles[weight_map[scale_key]] = scale_handle
-
-        self._handles = list(handles.values())
-        self._shards = shards
-        self._shard_ends = torch.tensor([shard.shape[0] for shard in shards]).cumsum(0)
-        self._scale = scale_handle.get_tensor(scale_key).reshape(())
-        self._host_constants = (
-            self.layer_multipliers.cpu(),
-            self.ngram_heads_vocab_sizes.cpu(),
-            self.ngram_heads_offsets.cpu(),
-        )
-        expected_rows = int(self._host_constants[1][-1] + self._host_constants[2][-1])
-        if int(self._shard_ends[-1]) < expected_rows:
-            raise RuntimeError(
-                f"PLE table has {int(self._shard_ends[-1])} rows, needs {expected_rows}"
-            )
-
-    def _current_ngram_ids(self) -> torch.Tensor:
-        if self._host_constants is None:
-            raise RuntimeError("Qwen4-Exp PLE host weights are not loaded")
-        batch = get_global_ctx().batch
-        reqs = batch.padded_reqs if batch.is_decode else batch.reqs
-        multipliers, vocab_sizes, offsets = self._host_constants
-        pieces = []
-        forwarded_host = None
-        forwarded_offset = 0
-        for req in reqs:
-            extend_len = req.extend_len
-            forwarded = None
-            if req.input_ids.numel() < req.device_len:
-                if forwarded_host is None:
-                    forwarded_host = batch.input_ids.detach().to(device="cpu")
-                forwarded = forwarded_host[
-                    forwarded_offset : forwarded_offset + extend_len
-                ]
-            tokens = _ple_request_tokens(req, forwarded)
-            all_ids = build_ngram_ids(
-                tokens,
-                ngram_size=self.ngram_size,
-                heads_per_ngram=self.heads_per_ngram,
-                eos_token_id=self.eos_token_id,
-                multipliers=multipliers,
-                vocab_sizes=vocab_sizes,
-                offsets=offsets,
-            )
-            pieces.append(all_ids[req.cached_len : req.device_len])
-            forwarded_offset += extend_len
-        result = torch.cat(pieces, dim=0)
-        if result.shape[0] != batch.input_ids.numel():
-            raise RuntimeError(
-                f"PLE token count {result.shape[0]} does not match batch {batch.input_ids.numel()}"
-            )
-        return result
-
-    def forward(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self._dummy:
-            token_count = get_global_ctx().batch.input_ids.numel()
-            return torch.zeros(token_count, self.embedding_dim, device=device, dtype=dtype)
-        ngram_ids = self._current_ngram_ids().reshape(-1)
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-            try:
-                import logging as _logging
-                from freetoken.utils.logger import init_logger
-                _log = init_logger("freetoken.qwen4exp.ple")
-                _dev = "cpu"
-                _n = ngram_ids.numel()
-                _last = ngram_ids[-1].tolist() if _n else -1
-                _batch = get_global_ctx().batch
-                _reqs = _batch.padded_reqs if _batch.is_decode else _batch.reqs
-                _tail = [(r.uid, r.cached_len, r.device_len) for r in _reqs]
-                _log.info(
-                    "PLE layer=%d rows=%d last_ngram=%d reqs=%s",
-                    self.layer_id, _n, _last, str(_tail),
-                )
-            except Exception:  # pragma: no cover
-                pass
-        shard_ids = torch.bucketize(ngram_ids, self._shard_ends, right=True)
-        output = torch.empty(
-            ngram_ids.numel(),
-            self.head_dim,
-            dtype=torch.uint8,
-            pin_memory=torch.cuda.is_available(),
-        )
-        starts = torch.cat([self._shard_ends.new_zeros(1), self._shard_ends[:-1]])
-        for shard_id in shard_ids.unique().tolist():
-            positions = torch.nonzero(shard_ids == shard_id, as_tuple=False).flatten()
-            local_ids = ngram_ids.index_select(0, positions) - starts[shard_id]
-            rows = self._shards[shard_id].index_select(0, local_ids)
-            output.index_copy_(0, positions, rows)
-        fp8 = output.to(device=device, non_blocking=True).view(torch.float8_e4m3fn)
-        embedded = fp8.to(dtype) * self._scale.to(device=device, dtype=dtype)
-        if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-            try:
-                from freetoken.utils.logger import init_logger
-                _log = init_logger("freetoken.qwen4exp.ple")
-                _tail_rows = embedded[-3:].float() if embedded.shape[0] >= 3 else embedded.float()
-                _norms = _tail_rows.norm(dim=-1).tolist()
-                _log.info(
-                    "PLE emb layer=%d n=%d last3_norms=%s",
-                    self.layer_id, embedded.shape[0], [round(x, 4) for x in _norms],
-                )
-            except Exception:  # pragma: no cover
-                pass
-        return embedded.view(-1, self.embedding_dim)
-
-
-class _DepthwiseConv(BaseOP):
-    def __init__(self, channels: int, kernel_size: int):
-        self.weight = torch.empty(channels, 1, kernel_size)
-
-
-class _PLELayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        args: Qwen4ExpArgs = config.qwen4_args
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.hc_count = args.hc_count
-        hc_size = self.hidden_size * self.hc_count
-        self.ple_embedding = _HostNGramEmbedding(config, layer_id)
-        self.key_proj = LinearReplicated(args.ple_embed_dim, hc_size, has_bias=False)
-        self.value_proj = LinearReplicated(args.ple_embed_dim, self.hidden_size, has_bias=False)
-        self.norm_key = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.norm_query = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.norm_conv = _GroupedRMSNorm(hc_size, self.hidden_size, config.rms_norm_eps)
-        self.conv1d = _DepthwiseConv(hc_size, args.ple_conv_kernel_size)
-        self.dilation = args.ngram_size
-        self.state_len = (args.ple_conv_kernel_size - 1) * self.dilation
-        self._conv_states: dict[int, torch.Tensor] = {}
-
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        self.ple_embedding.load_host_weights(model_path, dummy=dummy)
-
-    def _short_conv(self, hidden: torch.Tensor) -> torch.Tensor:
-        batch = get_global_ctx().batch
-        reqs = batch.padded_reqs if batch.is_decode else batch.reqs
-        outputs = []
-        offset = 0
-        weight = self.conv1d.weight
-        for req in reqs:
-            length = req.extend_len
-            current = hidden[offset : offset + length].transpose(0, 1).unsqueeze(0)
-            state = self._conv_states.get(req.table_idx)
-            if req.cached_len == 0:
-                state = current.new_zeros(1, current.shape[1], self.state_len)
-            elif state is None:
-                raise RuntimeError(
-                    "Qwen4-Exp PLE state cannot resume a radix prefix; serve with --cache-type naive"
-                )
-            combined = torch.cat([state, current], dim=-1)
-            convolved = F.conv1d(
-                combined,
-                weight,
-                groups=weight.shape[0],
-                dilation=self.dilation,
-            )
-            outputs.append(F.silu(convolved).squeeze(0).transpose(0, 1))
-            self._conv_states[req.table_idx] = combined[..., -self.state_len :].detach()
-            offset += length
-        return torch.cat(outputs, dim=0)
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        embeddings = self.ple_embedding.forward(hidden.device, hidden.dtype)
-        key = self.norm_key.forward(self.key_proj.forward(embeddings))
-        key = key.view(-1, self.hc_count, self.hidden_size)
-        value = self.value_proj.forward(embeddings)
-        query = self.norm_query.forward(hidden).view(-1, self.hc_count, self.hidden_size)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gated = (torch.sigmoid(gate) * value.unsqueeze(1)).flatten(1)
-        normalized = self.norm_conv.forward(gated)
-        return gated + self._short_conv(normalized)
-
-
-class _QSAIndexer(BaseOP):
-    """Qwen4-Exp's weight-free four-head compressed-key indexer."""
-
-    def __init__(self, config: ModelConfig, rotary):
-        args: Qwen4ExpArgs = config.qwen4_args
-        self.num_q_heads = args.indexer_n_heads
-        self.num_kv_heads = args.indexer_kv_heads
-        self.head_dim = args.indexer_head_dim
-        self.q_dim = self.num_q_heads * self.head_dim
-        self.k_dim = self.num_kv_heads * self.head_dim
-        self.index_qk_proj = LinearReplicated(
-            config.hidden_size, self.q_dim + self.k_dim, has_bias=False
-        )
-        self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, config.rms_norm_eps)
-        self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, config.rms_norm_eps)
-        self.rotary = rotary
-        if self.rotary.rotary_dim > self.head_dim:
-            raise ValueError(
-                f"QSA index head {self.head_dim} is smaller than rotary dim "
-                f"{self.rotary.rotary_dim}"
-            )
-
-    def _apply_rope(self, tensor: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        if tensor.numel() == 0:
-            return tensor
-        shape = tensor.shape
-        flat = tensor.reshape(shape[0], -1).contiguous()
-        # The shared RoPE object was built for 256-wide main heads.  Call its
-        # kernel with the 128-wide QSA head size instead of using forward(),
-        # which would interpret the fused index-query row with the wrong stride.
-        dummy_key = torch.zeros(
-            shape[0], self.head_dim, dtype=tensor.dtype, device=tensor.device
-        )
-        self.rotary.apply_inplace(
-            positions=positions,
-            query=flat,
-            key=dummy_key,
-            head_size=self.head_dim,
-        )
-        return flat.view(shape)
-
-    def project(self, hidden: torch.Tensor, positions: torch.Tensor):
-        qk = self.index_qk_proj.forward(hidden)
-        q_raw, k_raw = torch.split(qk, (self.q_dim, self.k_dim), dim=-1)
-        q = q_raw.view(-1, self.num_q_heads, self.head_dim).contiguous()
-        k = k_raw.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-        q = self.q_layernorm.forward(q)
-        q = self._apply_rope(q, positions)
-        return q, k
-
-    def normalize_compressed_keys(
-        self, keys: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        keys = self.k_layernorm.forward(keys.contiguous())
-        return self._apply_rope(keys, positions)
-
-
-class Qwen4ExpAttention(Qwen3_5Attention):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        super().__init__(config, layer_id)
-        self.rotary = _Qwen4MRoPE(config)
-        # Qwen4 stores centered q/k norm weights (effective scale is 1 + w).
-        self.q_norm = GemmaPlusOneRMSNorm(config.head_dim, config.rms_norm_eps)
-        self.k_norm = GemmaPlusOneRMSNorm(config.head_dim, config.rms_norm_eps)
-        self.indexer = _QSAIndexer(config, self.rotary)
-
-    @nvtx_annotate("QSA")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ctx = get_global_ctx()
-        rope_positions = ctx.batch.rope_positions
-        if rope_positions is None:
-            rope_positions = ctx.batch.positions
-        q, k, v, gate = self._project(x, rope_positions)
-        _layerdbg("q", self.layer_id, q)
-        _layerdbg("k", self.layer_id, k)
-        _layerdbg("v", self.layer_id, v)
-        _layerdbg("gate_pre", self.layer_id, gate)
-        index_q, index_k = self.indexer.project(x, rope_positions)
-        _layerdbg("index_q", self.layer_id, index_q)
-        _layerdbg("index_k", self.layer_id, index_k)
-        output = ctx.attn_backend.qsa_forward(
-            q,
-            k,
-            v,
-            index_q,
-            index_k,
-            self.indexer,
-            self.layer_id,
-            ctx.batch,
-        )
-        _layerdbg("qsa_out", self.layer_id, output)
-        return self._combine(output, gate)
+def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
+    """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
+    from .gdn import Qwen4ExpGatedDeltaNet
+
+    g = config.linear_attention_group()
+    return Qwen4ExpGatedDeltaNet(
+        hidden_size=config.hidden_size,
+        num_k_heads=g.num_key_heads,
+        num_v_heads=g.num_value_heads,
+        head_k_dim=g.key_head_dim,
+        head_v_dim=g.value_head_dim,
+        conv_kernel_size=g.conv_kernel_dim,
+        rms_norm_eps=config.rms_norm_eps,
+        layer_id=layer_id,
+        output_gate=g.output_gate,
+        # Qwen3.8's block-fp8 checkpoint keeps the GDN projections bf16 (only the routed
+        # experts are quantized), so do not let expert_quant flip them to Fp8Block.
+        expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
+        attn_quant=config.attn_quant,
+    )
 
 
 class Qwen4ExpDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    """One decoder layer over the hyper-connection streams (see the module docstring for the flow)."""
+
+    def __init__(self, config: ModelConfig, layer_id: int) -> None:
         self._layer_id = layer_id
         self._is_linear = config.is_linear_layer(layer_id)
-        dense_config = replace(config, expert_quant="none", attn_quant="none")
         if self._is_linear:
-            group = config.linear_attention_group()
-            assert group is not None
-            self.linear_attn = Qwen3_5GatedDeltaNet(
-                hidden_size=config.hidden_size,
-                num_k_heads=group.num_key_heads,
-                num_v_heads=group.num_value_heads,
-                head_k_dim=group.key_head_dim,
-                head_v_dim=group.value_head_dim,
-                conv_kernel_size=group.conv_kernel_dim,
-                rms_norm_eps=config.rms_norm_eps,
-                layer_id=layer_id,
-                expert_quant="none",
-                attn_quant="none",
-            )
-            self.linear_attn.norm = _GatedRMSNorm(
-                group.value_head_dim,
-                config.rms_norm_eps,
-                config.qwen4_args.output_gate_type,
-            )
+            self.linear_attn = build_linear_mixer(config, layer_id)
         else:
-            self.self_attn = Qwen4ExpAttention(dense_config, layer_id)
-        self.mlp = _SparseMoE(config, layer_id)
+            self.self_attn = Qwen4ExpAttention(config, layer_id)
+        self.mlp = Qwen4ExpMoE(config, layer_id)
+        self.attn_hyper_connection = GatedResidual(config)
+        self.mlp_hyper_connection = GatedResidual(config)
         self.ple = (
-            _PLELayer(config, layer_id)
-            if layer_id in config.qwen4_args.ple_layer_ids
-            else None
+            PLELayer(config, layer_id) if layer_id in config.qwen4_args.ple_layer_ids else None
         )
-        self.attn_hyper_connection = _GatedResidual(config)
-        self.attn_hyper_connection._dbg_name = f"L{layer_id}attnHC"
-        self.mlp_hyper_connection = _GatedResidual(config)
-        self.mlp_hyper_connection._dbg_name = f"L{layer_id}mlpHC"
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        _layerdbg("in", self._layer_id, hidden)
+    def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden)
-        _layerdbg("post_ple", self._layer_id, hidden)
-        mixed, residual, weights = self.attn_hyper_connection.forward(hidden)
-        _layerdbg("attn_hc_out", self._layer_id, mixed)
-        mixed = (
-            self.linear_attn.forward(mixed)
-            if self._is_linear
-            else self.self_attn.forward(mixed)
-        )
-        hidden = residual + (mixed.unsqueeze(1) * weights.unsqueeze(-1)).flatten(1)
-        _layerdbg("post_attn", self._layer_id, hidden)
-        mixed, residual, weights = self.mlp_hyper_connection.forward(hidden)
-        _layerdbg("mlp_hc_out", self._layer_id, mixed)
-        mixed = self.mlp.forward(mixed)
-        hidden = residual + (mixed.unsqueeze(1) * weights.unsqueeze(-1)).flatten(1)
-        _layerdbg("post_mlp", self._layer_id, hidden)
-        return hidden
+            hidden = hidden + self.ple.forward(hidden, batch)
+        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        if self._is_linear:
+            block_output = self.linear_attn.forward(block_input)
+        else:
+            block_output = self.self_attn.forward(block_input, batch)
+        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
 
 
 class Qwen4ExpModel(BaseOP):
-    def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+    def __init__(self, config: ModelConfig) -> None:
+        self.hc_count = config.qwen4_args.hc_count
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+        )
         self.layers = OPList(
             [Qwen4ExpDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
-        self.hyper_connection_mixer = _GatedResidual(config, combine=False)
-        self.hyper_connection_mixer._dbg_name = "MIXER"
-        self.hc_count = config.qwen4_args.hc_count
-        self._image_token_id = config.image_token_id
+        self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        # plain tuple (not an OP child), so it never shows up in the state dict
+        self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        for layer in self.layers.op_list:
-            if layer.ple is not None:
-                layer.ple.load_host_weights(model_path, dummy=dummy)
+    @property
+    def ple_layers(self) -> List[PLELayer]:
+        """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
+        return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids)
-        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
-        if mm_embeds is not None and self._image_token_id is not None:
-            mask = input_ids == self._image_token_id
-            slots = int(mask.sum().item())
-            if slots != mm_embeds.shape[0]:
-                raise ValueError(
-                    f"image-token slots ({slots}) do not match vision features "
-                    f"({mm_embeds.shape[0]})"
-                )
-            hidden = hidden.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(hidden.dtype))
-        hidden = hidden.repeat(1, self.hc_count)
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        meta = None
+        if self._ple:
+            from .ple import build_ple_metadata, commit_ngram_context
+
+            meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
+            for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
+                ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
-            hidden = layer.forward(hidden)
-        return self.hyper_connection_mixer.forward(hidden)
+            hidden = layer.forward(hidden, batch)
+        if meta is not None:
+            # single writer: the layers only read the context, so a second PLE layer's
+            # prefetch sees the un-rolled window
+            commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        return self.hyper_connection_mixer.mix(hidden)[0]
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig) -> None:
+        self._config = config
         self.model = Qwen4ExpModel(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-        )
-        if config.is_multimodal:
-            from .vision import Qwen4VisionModel
+        if getattr(config, "lm_head_quant", "none") == "nvfp4":
+            from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
-            self.visual = Qwen4VisionModel(config.vision_config)
+            assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
+            self.lm_head = Nvfp4LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        else:
+            self.lm_head = ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            )
         super().__init__()
 
-    @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
-    ) -> torch.Tensor:
-        if not hasattr(self, "visual"):
-            raise RuntimeError("Qwen4-Exp vision weights are not loaded")
-        return self.visual.forward(pixel_values, image_grid_thw)
+    def load_host_tables(self, engine_config) -> int:
+        """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        ple_layers = self.model.ple_layers
+        if not ple_layers:
+            return 0
+        from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
 
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        self.model.load_host_weights(model_path, dummy=dummy)
+        if getattr(engine_config, "use_dummy_weight", False):
+            # Dummy fill leaves the int64 hash buffers garbage (a zero vocab size divides by
+            # zero in the hash), so re-derive the real constants and read a zero table.
+            for ple in ple_layers:
+                args = ple.args
+                mult, sizes, offsets = derive_ngram_hash_constants(
+                    vocab_size=self._config.vocab_size,
+                    ngram_size=args.ngram_size,
+                    num_ngram_heads=args.num_ngram_heads,
+                    ngram_vocab_size_base=args.ngram_vocab_size_base,
+                    ple_layer_index=ple.ple_index,
+                )
+                emb = ple.ple_embedding
+                emb.layer_multipliers.copy_(torch.tensor(mult, dtype=torch.int64))
+                emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
+                emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
+                emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            return 0
+
+        from .weight import load_ple_table
+
+        table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
+        self._ple_table = table  # owns the pinned HostBank; keep it alive
+        for ple in ple_layers:
+            ple.ple_embedding.attach_table(
+                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
+            )
+        return table.bank.nbytes
 
     def forward(self) -> torch.Tensor:
-        hidden = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(hidden)
+        batch = get_global_ctx().batch
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
 
-__all__ = ["Qwen4ExpForCausalLM", "build_ngram_ids"]
+__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

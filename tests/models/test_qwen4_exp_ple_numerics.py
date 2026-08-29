@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.models.qwen4_exp.model import build_ngram_ids
+from freetoken.models.qwen4_exp.config import Qwen4ExpArgs
+from freetoken.models.qwen4_exp.ple import NGramEmbedding, PLEMetadata
 
 # Qwen3.8-Flash-Next-UD-Q3_K_XL-merged.gguf, qwen4exp.ple-Metadaten (eingefroren)
 EOS_TOKEN_ID = 248044
@@ -83,16 +84,51 @@ ANCHOR_CASES = {
 }
 
 
-def _ids(tokens: list[int]) -> torch.Tensor:
-    out = build_ngram_ids(
-        torch.tensor(tokens),
+def _args() -> Qwen4ExpArgs:
+    return Qwen4ExpArgs(
+        hidden_size=2560,
+        hc_count=4,
+        hc_lowrank=320,
+        ple_layer_ids=(1,),
+        ple_embed_dim=2560,
+        ple_conv_kernel_size=4,
         ngram_size=NGRAM_SIZE,
         heads_per_ngram=HEADS_PER_NGRAM,
-        eos_token_id=EOS_TOKEN_ID,
-        multipliers=torch.tensor(MULTIPLIERS, dtype=torch.long),
-        vocab_sizes=torch.tensor(HEAD_VOCAB_SIZES, dtype=torch.long),
-        offsets=torch.tensor(HEAD_OFFSETS, dtype=torch.long),
+        ngram_vocab_size_base=20_000_000,
+        make_ngram_vocab_size_divisible_by=1,
+        split_ngram_parts=1,
+        ngram_boundary_token_id=EOS_TOKEN_ID,
+        index_n_heads=4,
+        index_kv_heads=1,
+        index_head_dim=128,
+        index_budget=2048,
+        index_ratio=4,
     )
+
+
+def _ids(tokens: list[int]) -> torch.Tensor:
+    """Frozen hash ids through the merged-tree NGramEmbedding.
+
+    One fresh request (all-eos n-gram context) reproduces the pre-merge
+    ``build_ngram_ids`` semantics: shifts beyond the first token read eos.
+    """
+    n = len(tokens)
+    emb = NGramEmbedding(_args())
+    emb.layer_multipliers.copy_(torch.tensor(MULTIPLIERS, dtype=torch.long))
+    emb.ngram_heads_vocab_sizes.copy_(torch.tensor(HEAD_VOCAB_SIZES, dtype=torch.long))
+    emb.ngram_heads_offsets.copy_(torch.tensor(HEAD_OFFSETS, dtype=torch.long))
+    meta = PLEMetadata(
+        input_ids=torch.tensor(tokens),
+        cu_seqlens=torch.tensor([0, n]),
+        seq_lens=(n,),
+        ngram_context=torch.full(
+            (1, NGRAM_SIZE - 1), EOS_TOKEN_ID, dtype=torch.long
+        ),
+        state_slots=torch.zeros(1, dtype=torch.long),
+        fresh_slots=None,
+        is_decode=False,
+    )
+    out = emb.row_ids(meta)
     assert out.shape == (len(tokens), 16)
     return out
 

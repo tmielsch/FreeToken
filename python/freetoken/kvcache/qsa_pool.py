@@ -1,22 +1,52 @@
-"""Paged KV storage for Qwen compressed sparse attention (QSA).
+"""QSA compressed-block sparse KV pool: paged GQA K/V + compressed index keys + pending ring.
 
-The ordinary K/V cache keeps one row per token.  The QSA index cache keeps
-one row per ``compress_ratio`` tokens.  A full KV page therefore maps to one
-smaller, page-aligned QSA page.  This keeps the translation exact and cheap:
-the compressed row for a complete token group is ``full_row // ratio``.
+Qwen3.8-Flash-Next scores whole ``index_ratio``-token groups instead of single tokens, so
+its indexer slab holds ONE compressed key row per group, addressed by ``slot //
+index_ratio``. Because ``page_size % index_ratio == 0``, a group's tokens always live in one
+page at consecutive slots, which makes that division well-defined: the compressed rows are a
+1/ratio shadow of the K/V pages and follow page sharing and eviction for free -- no
+allocator, no free, no clear (SGLang qsa_kv_pool / vLLM compressed-region precedent).
+
+Two tiers ride alongside the shadow slab and are NOT per-token:
+- ``pending_ring``: the last ``ring_capacity`` pre-RoPE index keys of each running request (sized by ``ring_capacity_for``), indexed by ``Req.table_idx``. A group that straddles two forwards (chunked prefill, and
+  every decode step) reads its already-consumed members from here. Never cleared: a new
+  tenant of a table_idx starts at a group boundary (cached_len is 0 or a page multiple), so
+  its first closing group takes every member from its own forward.
+- scratch rows at ``cmp_scratch_base``: one row per request slot, the write target for rows
+  whose group does not close in this forward, so the compress kernel scatters unconditionally
+  with no negative index and no cross-row conflict (DSV4 precedent).
+
+The slab is amortized into the per-token KV price (``unit_bytes``); the ring and scratch are
+fixed and priced through ``kv_cost``'s ``fixed_cache_size``.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
 
 from .mha_pool import MHAKVCache
 
+# The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
+_INDEX_DTYPE_BYTES = 2
+
 
 class QSAKVCache(MHAKVCache):
-    """MHA/GQA K/V plus compressed QSA index keys and a small pending ring."""
+    """MHA paged pool + the compressed index-key slab + the per-request pending ring.
+
+    ``cmp_k_cache(slot)`` is row-flat ``[num_pages * page_size // index_ratio + num_req_slots,
+    index_head_dim]``: row ``r < cmp_scratch_base`` holds the compressed key of the token group
+    whose K/V slots are ``[r * index_ratio, (r + 1) * index_ratio)``, and the rows from
+    ``cmp_scratch_base`` on are the per-request-slot scratch sinks. ``slot`` is the sparse
+    layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
+    """
+
+    @classmethod
+    def ring_capacity_for(cls, index_ratio: int, num_speculative_tokens: int = 0) -> int:
+        """Ring depth: one row per pending position, keyed ``position % capacity``; spec decode widens by the draft depth (vLLM sizing)."""
+        return index_ratio * math.ceil((index_ratio + num_speculative_tokens) / index_ratio)
 
     def __init__(
         self,
@@ -27,26 +57,38 @@ class QSAKVCache(MHAKVCache):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        index_num_kv_heads: int,
         index_head_dim: int,
-        compress_ratio: int,
-        layer_ids: Sequence[int],
+        num_index_layers: int,
+        index_ratio: int,
+        num_req_slots: int,
+        ring_capacity: int | None = None,
+        layer_ids: Sequence[int] | None = None,
     ) -> None:
-        if compress_ratio < 2 or page_size % compress_ratio:
+        if index_ratio < 1 or page_size % index_ratio != 0:
+            # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(
-                "QSA needs a compression ratio >= 2 that divides the KV page size"
+                f"QSA needs page_size ({page_size}) divisible by index_ratio ({index_ratio})"
             )
-        if dtype.itemsize != 2:
-            raise ValueError(f"QSA index keys require a 2-byte compute dtype, got {dtype}")
-        self._page_size = int(page_size)
-        self._compress_ratio = int(compress_ratio)
-        self._compressed_page_size = self._page_size // self._compress_ratio
-        self._index_num_kv_heads = int(index_num_kv_heads)
-        self._index_head_dim = int(index_head_dim)
-        self._num_index_layers = len(layer_ids)
-        self._pending_k: torch.Tensor | None = None
-        self._pending_pos: torch.Tensor | None = None
-        self._pending_rope: torch.Tensor | None = None
+        if ring_capacity is None:
+            ring_capacity = self.ring_capacity_for(index_ratio)
+        if ring_capacity < index_ratio:
+            # A closing group reads up to index_ratio - 1 past members plus this forward's.
+            raise ValueError(
+                f"QSA needs ring_capacity ({ring_capacity}) >= index_ratio ({index_ratio})"
+            )
+        # Index keys ride the compute dtype (the model's index_k is engine-dtype). The KV cost
+        # model budgets 2 bytes per token per index layer for the slab
+        # (base.spec_kv_bytes_per_token); keep the two in lockstep.
+        assert dtype.itemsize == _INDEX_DTYPE_BYTES, (
+            f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
+        )
+        self._index_head_dim = index_head_dim
+        self._num_index_layers = num_index_layers
+        self._index_ratio = index_ratio
+        self._num_req_slots = num_req_slots
+        self._ring_capacity = ring_capacity
+        self._index_dtype = dtype
+        self._page_size = page_size
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -57,131 +99,114 @@ class QSAKVCache(MHAKVCache):
             device=device,
             layer_ids=layer_ids,
         )
-        self._alloc_compressed(num_pages)
+        self._zero_kv_slabs()
+        self._alloc_index_tiers(num_pages)
 
-    def _alloc_compressed(self, num_pages: int) -> None:
-        self._compressed_k = torch.empty(
+    def _zero_kv_slabs(self) -> None:
+        # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
+        # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
+        # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
+        self._kv_buffer.zero_()
+
+    def _alloc_index_tiers(self, num_pages: int) -> None:
+        # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
+        # never-written tail rows dotting to a finite 0. Written rows are never cleared again,
+        # so the kernel must clamp visible blocks to kvlen // index_ratio.
+        self._cmp_scratch_base = num_pages * self._page_size // self._index_ratio
+        self._cmp_k_buffer = torch.zeros(
             self._num_index_layers,
-            num_pages,
-            self._compressed_page_size,
-            self._index_num_kv_heads,
+            self._cmp_scratch_base + self._num_req_slots,
             self._index_head_dim,
-            dtype=self.dtype,
-            device=self.device,
+            dtype=self._index_dtype,
+            device=self._device,
+        )
+        self._pending_ring = torch.zeros(
+            self._num_req_slots,
+            self._num_index_layers,
+            self._ring_capacity,
+            self._index_head_dim,
+            dtype=self._index_dtype,
+            device=self._device,
         )
 
     def rebuild(self, num_pages: int) -> None:
-        self._compressed_k = None
+        # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
+        # empty_cache), then re-derive them at the new page count. If the index alloc itself
+        # fails (OOM), null the K/V slab too and re-raise: a pool with a grown K/V slab and no
+        # index slab would mis-serve silently. Rebuild is idle-only, so zeroing the ring here
+        # cannot drop a live request's pending members.
+        self._cmp_k_buffer = None
+        self._pending_ring = None
         super().rebuild(num_pages)
-        self._alloc_compressed(num_pages)
+        self._zero_kv_slabs()
+        try:
+            self._alloc_index_tiers(num_pages)
+        except Exception:
+            self._kv_buffer = None
+            self._k_buffer = None
+            self._v_buffer = None
+            raise
+
+    @classmethod
+    def kv_cost(cls, config) -> tuple[int, int, int, int]:
+        from .base import spec_kv_bytes_per_token
+        from freetoken.attention import AttnType
+
+        num_req_slots = config.max_running_req + 1
+        per_token = 0
+        fixed = 0
+        for spec in config.model_config.kv_cache_group_specs():
+            if spec.is_swa:
+                continue
+            per_token += spec_kv_bytes_per_token(spec, config)
+            if spec.attn_type is AttnType.QSA:
+                # One index-key row = all index layers at one position.
+                row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
+                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+        return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
+        # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
+        # the scratch rows are the fixed term kv_cost reports separately.
         kv, swa = super().unit_bytes()
-        full_tokens = int(self._kv_buffer.shape[2]) * self._page_size
-        index_bytes = int(self._compressed_k.numel() * self._compressed_k.element_size())
-        return kv + index_bytes // full_tokens, swa
+        tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
+        slab = (
+            self._num_index_layers
+            * self._cmp_scratch_base
+            * self._index_head_dim
+            * self._index_dtype.itemsize
+        )
+        return kv + slab // tokens, swa
+
+    def cmp_k_cache(self, slot: int) -> torch.Tensor:
+        """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
+        return self._cmp_k_buffer[slot]
+
+    def pending_ring(self, slot: int) -> torch.Tensor:
+        """One sparse layer's pending ring: ``[num_req_slots, ring_capacity, index_head_dim]``."""
+        return self._pending_ring[:, slot]
 
     @property
-    def compress_ratio(self) -> int:
-        return self._compress_ratio
+    def cmp_scratch_base(self) -> int:
+        """First scratch row of ``cmp_k_cache``; row ``cmp_scratch_base + table_idx`` sinks a
+        forward whose group does not close."""
+        return self._cmp_scratch_base
 
     @property
-    def compressed_page_size(self) -> int:
-        return self._compressed_page_size
+    def index_ratio(self) -> int:
+        return self._index_ratio
 
-    def compressed_k_cache(self, layer_id: int) -> torch.Tensor:
-        """Return row-flat compressed keys ``[rows, kv_heads, index_dim]``."""
-        return self._compressed_k[self._dense(layer_id)].view(
-            -1, self._index_num_kv_heads, self._index_head_dim
-        )
+    @property
+    def index_head_dim(self) -> int:
+        return self._index_head_dim
 
-    def store_compressed_k(
-        self, keys: torch.Tensor, compressed_rows: torch.Tensor, layer_id: int
-    ) -> None:
-        self.compressed_k_cache(layer_id)[compressed_rows.long()] = keys
+    @property
+    def ring_capacity(self) -> int:
+        return self._ring_capacity
 
-    def ensure_pending_capacity(self, request_rows: int) -> None:
-        """Allocate or grow the per-request incomplete-group ring.
-
-        The ring is tiny compared with the paged cache.  It stores at most
-        ``ratio - 1`` useful raw keys per active request and layer.
-        """
-        current = 0 if self._pending_k is None else int(self._pending_k.shape[1])
-        if current >= request_rows:
-            return
-        new_rows = max(request_rows, max(16, current * 2))
-        shape = (
-            self._num_index_layers,
-            new_rows,
-            self._compress_ratio,
-            self._index_num_kv_heads,
-            self._index_head_dim,
-        )
-        pending = torch.empty(shape, dtype=self.dtype, device=self.device)
-        positions = torch.full(
-            shape[:3], -1, dtype=torch.int64, device=self.device
-        )
-        rope = torch.full(
-            (*shape[:3], 3), -1, dtype=torch.int64, device=self.device
-        )
-        if self._pending_k is not None:
-            pending[:, :current].copy_(self._pending_k)
-            positions[:, :current].copy_(self._pending_pos)
-            rope[:, :current].copy_(self._pending_rope)
-        self._pending_k = pending
-        self._pending_pos = positions
-        self._pending_rope = rope
-
-    def clear_pending(self, layer_id: int, request_row: int) -> None:
-        self._pending_pos[self._dense(layer_id), request_row].fill_(-1)
-
-    def pending_group(
-        self, layer_id: int, request_row: int, positions: torch.Tensor
-    ) -> torch.Tensor:
-        dense = self._dense(layer_id)
-        slots = torch.remainder(positions, self._compress_ratio).long()
-        actual = self._pending_pos[dense, request_row].index_select(0, slots)
-        expected = positions.to(device=actual.device, dtype=actual.dtype)
-        if not torch.equal(actual, expected):
-            raise RuntimeError(
-                "QSA pending-key state is missing; use the naive cache and do not "
-                "resume a prefix without its QSA state"
-            )
-        return self._pending_k[dense, request_row].index_select(0, slots)
-
-    def pending_rope_group(
-        self, layer_id: int, request_row: int, positions: torch.Tensor
-    ) -> torch.Tensor:
-        """Return stored [tokens, 3] rotary coordinates after state validation."""
-        self.pending_group(layer_id, request_row, positions)
-        dense = self._dense(layer_id)
-        slots = torch.remainder(positions, self._compress_ratio).long()
-        return self._pending_rope[dense, request_row].index_select(0, slots)
-
-    def store_pending(
-        self,
-        layer_id: int,
-        request_row: int,
-        positions: torch.Tensor,
-        keys: torch.Tensor,
-        rope_positions: torch.Tensor | None = None,
-    ) -> None:
-        dense = self._dense(layer_id)
-        slots = torch.remainder(positions, self._compress_ratio).long()
-        self._pending_k[dense, request_row].index_copy_(0, slots, keys)
-        self._pending_pos[dense, request_row].index_copy_(
-            0, slots, positions.to(device=self.device, dtype=torch.int64)
-        )
-        if rope_positions is None:
-            rope_positions = positions.to(device=self.device, dtype=torch.int64).view(-1, 1).expand(-1, 3)
-        if rope_positions.shape != (positions.numel(), 3):
-            raise ValueError(
-                "QSA pending RoPE positions must have shape [tokens, 3], got "
-                f"{tuple(rope_positions.shape)}"
-            )
-        self._pending_rope[dense, request_row].index_copy_(
-            0, slots, rope_positions.to(device=self.device, dtype=torch.int64)
-        )
+    @property
+    def num_req_slots(self) -> int:
+        return self._num_req_slots
 
 
 __all__ = ["QSAKVCache"]

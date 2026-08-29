@@ -38,6 +38,15 @@ _DTYPE_FOR_GGML = {
 }
 
 
+def _long_tuple(value) -> tuple[int, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(int(v) for v in value)
+    try:
+        return tuple(int(v) for v in value.tolist())
+    except AttributeError:
+        return (int(value),)
+
+
 def _require_tp1(what: str) -> None:
     from freetoken.distributed import get_tp_info
 
@@ -109,6 +118,33 @@ def _dense_unquantized(t: GgufTensor, dtype: torch.dtype | None = None) -> torch
 def _centered_norm(t: GgufTensor) -> torch.Tensor:
     """Undo llama.cpp's +1 fold for FreeToken norms that apply 1+w at runtime."""
     return _dense_unquantized(t, torch.float32) - 1.0
+
+
+def gguf_ngram_constants(model_path: str) -> Tuple[list[int], list[int], list[int]]:
+    """Read the PLE n-gram hash constants llama.cpp stores as GGUF metadata.
+
+    Returns ``(layer_multipliers [ngram_size], head_vocab_sizes [num_heads],
+    head_offsets [num_heads])``. Shared by the resident weight iterator (which
+    feeds ``NGramEmbedding``'s int64 buffers) and the table backend (which sizes
+    itself against ``offsets[-1] + sizes[-1]``).
+    """
+    from freetoken.models.gguf.reader import gguf_config_source, load_gguf_metadata
+
+    source = gguf_config_source(model_path)
+    if source is None:
+        raise ValueError(f"cannot resolve Qwen4Exp GGUF source from {model_path}")
+    metadata = load_gguf_metadata(source)
+
+    def meta(name: str):
+        key = f"qwen4exp.ple.{name}"
+        if key not in metadata:
+            raise KeyError(f"Qwen4Exp GGUF is missing PLE metadata {key}")
+        return metadata[key]
+
+    multipliers = _long_tuple(meta("layer_multipliers"))
+    vocab_sizes = _long_tuple(meta("head_vocab_sizes"))
+    offsets = _long_tuple(meta("head_offsets"))
+    return list(multipliers), list(vocab_sizes), list(offsets)
 
 
 def _ungroup_v(
@@ -249,6 +285,7 @@ def iter_gguf_weights_impl(
     gdn_in: dict[int, dict[str, torch.Tensor]] = {}
     shared: dict[int, dict[str, torch.Tensor]] = {}
     indexer: dict[int, dict[str, torch.Tensor]] = {}
+    hc: dict[int, dict[str, object]] = {}
 
     def emit_qkv(layer: int):
         slots = qkv.get(layer)
@@ -319,6 +356,28 @@ def iter_gguf_weights_impl(
             for i, value in enumerate(values)
         ]
 
+    def emit_hc(layer: int, attr: str, prefix: str):
+        """Fuse ``hc_*_down + hc_*_inject`` into the merged down_block_inject op.
+
+        GatedResidual concatenates down [lowrank] and the inject logits [hc_count]
+        in one GEMM (plus dropped pad rows); the GGUF keeps them as separate
+        tensors, so the parts are fused exactly like qkv -- the merged output
+        keeps the same ``[:, :lowrank]`` / ``[:, lowrank:lowrank+hc]`` slices.
+        """
+        slots = hc.get(layer)
+        if slots is None or set(slots) != {"down", "inject"}:
+            return None
+        down, inject = slots["down"], slots["inject"]
+        del hc[layer]
+        base = f"model.layers.{layer}.{attr}.input_mix_weight_down_block_inject"
+        down_packed, inject_packed = down.packed(), inject.packed()
+        if down.ggml_type == inject.ggml_type:
+            return [(f"{base}.qweight", torch.cat([down_packed, inject_packed], dim=0))]
+        return [
+            (f"{base}.qweight_0", down_packed),
+            (f"{base}.qweight_1", inject_packed),
+        ]
+
     for t in _iter_selected(
         model_path, lambda name: _resident_name(name, config.num_layers)
     ):
@@ -349,6 +408,7 @@ def iter_gguf_weights_impl(
         base = f"model.layers.{layer}"
 
         # Hyper-connections: llama.cpp stored their plus-one norm scales already folded.
+        # down + inject fuse into the merged `input_mix_weight_down_block_inject` op.
         for prefix, attr in (
             ("hc_attn_", "attn_hyper_connection"),
             ("hc_ffn_", "mlp_hyper_connection"),
@@ -357,14 +417,18 @@ def iter_gguf_weights_impl(
                 yield f"{base}.{attr}.hc_norm.weight", _centered_norm(t)
                 break
             if suffix == prefix + "down.weight":
-                yield f"{base}.{attr}.input_mix_weight_down.qweight", t.packed()
-                break
-            if suffix == prefix + "up.weight":
+                hc.setdefault(layer, {})["down"] = t
+            elif suffix == prefix + "inject.weight":
+                hc.setdefault(layer, {})["inject"] = t
+            elif suffix == prefix + "up.weight":
                 yield f"{base}.{attr}.input_mix_weight_up.qweight", t.packed()
                 break
-            if suffix == prefix + "inject.weight":
-                yield f"{base}.{attr}.block_inject_weight.weight", _dense_unquantized(t)
-                break
+            else:
+                continue
+            ready = emit_hc(layer, attr, prefix)
+            if ready:
+                yield from ready
+            break
         if suffix.startswith("hc_attn_") or suffix.startswith("hc_ffn_"):
             continue
 
@@ -524,10 +588,21 @@ def iter_gguf_weights_impl(
         "gdn_in": sorted(gdn_in),
         "shared": sorted(shared),
         "indexer": sorted(indexer),
+        "hc": sorted(hc),
     }
     incomplete = {k: v for k, v in incomplete.items() if v}
     if incomplete:
         raise RuntimeError(f"incomplete Qwen4Exp GGUF fusion groups: {incomplete}")
+
+    # PLE hash constants: llama.cpp moves them into GGUF metadata (they are
+    # checkpoint tensors on the HF path), so the resident iterator feeds the
+    # NGramEmbedding int64 buffers from metadata instead.
+    for layer in config.qwen4_args.ple_layer_ids:
+        multipliers, vocab_sizes, offsets = gguf_ngram_constants(model_path)
+        prefix = f"model.layers.{layer}.ple.ple_embedding"
+        yield f"{prefix}.layer_multipliers", torch.tensor(multipliers, dtype=torch.long)
+        yield f"{prefix}.ngram_heads_vocab_sizes", torch.tensor(vocab_sizes, dtype=torch.long)
+        yield f"{prefix}.ngram_heads_offsets", torch.tensor(offsets, dtype=torch.long)
 
 
 def convert_qwen4exp_to_gguf(model, config, *, model_path: str) -> None:
@@ -601,12 +676,24 @@ def convert_qwen4exp_to_gguf(model, config, *, model_path: str) -> None:
     ]
 
     for layer_id, layer in enumerate(inner.layers.op_list):
-        # Both hyper-connection blocks.
+        # Both hyper-connection blocks: down + inject fuse into the merged
+        # `input_mix_weight_down_block_inject` GEMM (pad rows stay absent).
         for prefix, hc in (
             ("hc_attn", layer.attn_hyper_connection),
             ("hc_ffn", layer.mlp_hyper_connection),
         ):
-            swap(hc, "input_mix_weight_down", f"blk.{layer_id}.{prefix}_down.weight")
+            old = hc.input_mix_weight_down_block_inject
+            out_features, in_features = old.weight.shape
+            assert out_features == hc.lowrank + hc.hc_count + hc.pad_size
+            hc.input_mix_weight_down_block_inject = gguf_merged_or_plain(
+                in_features,
+                [hc.lowrank, hc.hc_count],
+                [
+                    qt(f"blk.{layer_id}.{prefix}_down.weight"),
+                    qt(f"blk.{layer_id}.{prefix}_inject.weight"),
+                ],
+                has_bias=False,
+            )
             swap(hc, "input_mix_weight_up", f"blk.{layer_id}.{prefix}_up.weight")
 
         # Shared expert (router and shared-expert gate stay dense F32/BF16).

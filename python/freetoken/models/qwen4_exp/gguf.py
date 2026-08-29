@@ -14,13 +14,13 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.models.config import (
+    FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
-    QSAAttentionGroupConfig,
     RotaryConfig,
 )
 
-from .args import Qwen4ExpArgs
+from .config import Qwen4ExpArgs, ple_slot_states
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -232,6 +232,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
     embed_quant, expert_types = _gguf_geometry(shim.model_path, num_layers)
     qwen4_args = Qwen4ExpArgs(
+        hidden_size=hidden,
         hc_count=int(g("hyper_connection.count")),
         hc_lowrank=int(g("hyper_connection.low_rank")),
         ple_layer_ids=ple_layer_ids,
@@ -240,16 +241,14 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         ngram_size=ngram_size,
         heads_per_ngram=heads_per_ngram,
         ngram_vocab_size_base=0,
+        make_ngram_vocab_size_divisible_by=1,
         split_ngram_parts=1,
-        eos_token_id=eos_token_id,
-        indexer_n_heads=indexer_n_heads,
-        indexer_kv_heads=1,
-        indexer_head_dim=indexer_head_dim,
-        indexer_budget=indexer_budget,
-        indexer_compress_ratio=index_compress_ratio,
-        output_gate_type="sigmoid",
-        mrope_section=mrope_section,
-        mrope_interleaved=True,
+        ngram_boundary_token_id=eos_token_id,
+        index_n_heads=indexer_n_heads,
+        index_kv_heads=1,
+        index_head_dim=indexer_head_dim,
+        index_budget=indexer_budget,
+        index_ratio=index_compress_ratio,
         gguf_model_path=shim.model_path,
         gguf_embed_quant=embed_quant,
         gguf_expert_types=expert_types,
@@ -264,19 +263,18 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             key_head_dim=ssm_state,
             value_head_dim=ssm_state,
             conv_kernel_dim=ssm_conv,
-            output_gate=True,
+            output_gate="sigmoid",
         ),
-        QSAAttentionGroupConfig(
-            name="qsa",
+        FullAttentionGroupConfig(
+            name="full",
             layer_ids=qsa_ids,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             rotary_config=rotary,
-            index_num_heads=indexer_n_heads,
-            index_num_kv_heads=1,
+            # the QSA slab geometry; index_ratio > 1 makes the pool factory pick QSA.
             index_head_dim=indexer_head_dim,
-            index_token_budget=indexer_budget,
-            index_compress_ratio=index_compress_ratio,
+            num_index_layers=len(qsa_ids),
+            index_ratio=index_compress_ratio,
         ),
     )
 
@@ -313,6 +311,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         ),
         attention_groups=groups,
         qwen4_args=qwen4_args,
+        slot_states=ple_slot_states(qwen4_args),
         requires_naive_cache=True,
         supports_cuda_graph=False,
     )

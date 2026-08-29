@@ -91,12 +91,14 @@ def test_qwen4exp_gguf_config_matches_released_geometry(monkeypatch):
     assert config.expert_quant == "gguf"
     assert config.qwen4_args.hc_count == 4
     assert config.qwen4_args.hc_lowrank == 320
-    assert config.qwen4_args.mrope_section == (11, 11, 10)
     assert config.qwen4_args.ple_layer_ids == (1,)
     assert config.qwen4_args.ple_embed_dim == 2560
-    assert config.qwen4_args.indexer_compress_ratio == 4
+    assert config.qwen4_args.ngram_boundary_token_id == 248044
+    assert config.qwen4_args.index_ratio == 4
+    assert config.qwen4_args.gguf_model_path == "unused.gguf"
     assert config.qwen4_args.gguf_embed_quant == GGML_Q8_0
     assert len(config.qwen4_args.gguf_expert_types) == 48
+    assert {s.name for s in config.slot_states} == {"ple_conv", "ple_ngram_ctx"}
     assert config.is_linear_layer(0)
     assert config.is_linear_layer(1)
     assert config.is_linear_layer(2)

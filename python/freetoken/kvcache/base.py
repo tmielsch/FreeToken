@@ -21,7 +21,10 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
+    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+
+    ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
+    ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
@@ -29,13 +32,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         * config.dtype.itemsize
         * spec.num_layers
     )
-    index_bytes = spec.index_head_dim * spec.num_index_layers * 2
-    if spec.attn_type.value == "qsa":
-        index_bytes *= spec.index_num_kv_heads
-        if index_bytes % spec.index_compress_ratio:
-            raise ValueError("QSA index bytes must divide evenly by its compression ratio")
-        index_bytes //= spec.index_compress_ratio
-    return per_token + index_bytes
+    return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
 class BaseKVCachePool(ABC):

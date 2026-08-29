@@ -37,10 +37,11 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
 
         convert_qwen4exp_to_gguf(self, config, model_path=model_path)
 
-        # The PLE table is host state rather than an ordinary state_dict tensor.
-        # Replace the HF FP8-shard object with the GGUF mmap row-gather object.
+        # The PLE table is host state rather than an ordinary state_dict tensor:
+        # the hash constants ride the resident iterator (GGUF metadata), and the
+        # table attach happens in load_host_tables. Record the quant type of the
+        # mmap'd table so the backend can validate the checkpoint later.
         from .gguf import _tensor_types_header_only
-        from .gguf_ple import GGUFHostNGramEmbedding
 
         tensor_types = _tensor_types_header_only(model_path)
         ple_type = tensor_types.get("per_layer_token_embd.weight")
@@ -48,11 +49,7 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
             raise ValueError(
                 "Qwen3.8 GGUF declares PLE layers but has no per_layer_token_embd.weight"
             )
-        for layer_id, layer in enumerate(self.model.layers.op_list):
-            if layer.ple is not None:
-                layer.ple.ple_embedding = GGUFHostNGramEmbedding(
-                    config, layer_id, int(ple_type)
-                )
+        self._ple_quant_type = int(ple_type) if ple_type is not None else None
 
         types = getattr(config.qwen4_args, "gguf_expert_types", None)
         if not types or len(types) != config.num_moe_layers:
@@ -116,10 +113,44 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
         cache.set_alphas(None, None)
         return cache
 
-    def load_host_weights(self, model_path: str, *, dummy: bool = False) -> None:
-        # After __init__ the only host-owned weight object is GGUFHostNGramEmbedding;
-        # Qwen4ExpModel already walks every PLE layer and calls this method on it.
-        self.model.load_host_weights(model_path, dummy=dummy)
+    def load_host_tables(self, engine_config):
+        """Attach the PLE n-gram table: pinned GGUF-mmap backend, or zeros for dummy weights.
+
+        Mirrors ``Qwen4ExpForCausalLM.load_host_tables``; the table cannot be a
+        pinned resident bank because it is the quantized ``per_layer_token_embd``
+        mmap (see ``gguf_ple.GGUFPLETableBackend``). Returns the pinned host bytes
+        the engine reserves from its pin budget (0: staging is a transient buffer).
+        """
+        ple_layers = self.model.ple_layers
+        if not ple_layers:
+            return 0
+        from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
+        from .gguf_ple import GGUFPLETableBackend
+
+        if getattr(engine_config, "use_dummy_weight", False):
+            # Dummy fill leaves the int64 hash buffers garbage (a zero vocab size divides by
+            # zero in the hash), so re-derive the real constants and read a zero table.
+            for ple in ple_layers:
+                args = ple.args
+                mult, sizes, offsets = derive_ngram_hash_constants(
+                    vocab_size=self._config.vocab_size,
+                    ngram_size=args.ngram_size,
+                    num_ngram_heads=args.num_ngram_heads,
+                    ngram_vocab_size_base=args.ngram_vocab_size_base,
+                    ple_layer_index=ple.ple_index,
+                )
+                emb = ple.ple_embedding
+                emb.layer_multipliers.copy_(torch.tensor(mult, dtype=torch.int64))
+                emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
+                emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
+                emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            return 0
+
+        table = GGUFPLETableBackend(engine_config.model_path, self._config.qwen4_args)
+        self._ple_table = table  # owns the GGUF readers; keep the mmap alive
+        for ple in ple_layers:
+            ple.ple_embedding.attach_table(table)
+        return 0
 
 
 __all__ = ["Qwen4ExpGGUFForCausalLM"]
