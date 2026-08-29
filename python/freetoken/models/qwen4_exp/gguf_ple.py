@@ -142,6 +142,9 @@ class GGUFPLETableBackend:
         self.num_rows = rows
         # Keep all readers alive so the memmap backing the selected tensor remains valid.
         self._readers = readers
+        # Capture-safe decode staging: host-side gather into a persistent device buffer.
+        self._staged_rows: torch.Tensor | None = None
+        self._staged_count = 0
 
         if self.num_rows < required_rows:
             raise RuntimeError(
@@ -152,30 +155,74 @@ class GGUFPLETableBackend:
         # CPU-side gather; staging happens in lookup. Kept for protocol symmetry.
         return None
 
-    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        ids = row_ids.reshape(-1)
-        if ids.numel() == 0:
-            return torch.empty(0, self.head_dim, device=row_ids.device, dtype=self.dtype)
+    def stage(self, ids_host: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Host-side gather into a persistent device staging buffer (capture-safe decode path).
+
+        ``ids_host`` holds the raw CPU row ids for this step; rows are index-selected out of the
+        file mmap into pinned memory and copied H2D into ``self._staged_rows``. The next
+        ``lookup`` consumes them (device-only dequant, no D2H sync / no host work in the graph),
+        then the staging stays valid for every PLE layer of that forward. Returns the staged
+        device rows so callers can front-run the copy.
+        """
+        ids = ids_host.reshape(-1)
+        n = int(ids.numel())
+        if n == 0:
+            self._staged_count = 0
+            return self._staged_rows
+        # Bounds validation is host-side here (ids already on the CPU), so the in-capture
+        # lookup never performs a device->host sync to range-check.
         lo, hi = int(ids.min()), int(ids.max())
         if lo < 0 or hi >= self.num_rows:
             raise IndexError(
                 f"PLE row id range [{lo}, {hi}] outside [0, {self.num_rows})"
             )
-
-        # NGramEmbedding computes row ids on the GPU; the packed source rows
-        # live in the file mmap, so the gather runs on the CPU. This D2H sync
-        # replaces the old host-side id computation (correctness-first; an
-        # async pipeline can overlap it with the layer-0 work later).
-        ids_cpu = ids.to("cpu", non_blocking=False)
-
-        # Gather into a tiny pinned staging buffer: 16 rows/token * 90 bytes/row
-        # for the current IQ4_NL model. The ~29 GiB source remains file-backed.
         staging = torch.empty(
-            (ids_cpu.numel(), self._row_bytes),
-            dtype=torch.uint8,
-            pin_memory=torch.cuda.is_available(),
+            (n, self._row_bytes), dtype=torch.uint8, pin_memory=torch.cuda.is_available()
         )
-        torch.index_select(self._packed_rows, 0, ids_cpu, out=staging)
+        torch.index_select(self._packed_rows, 0, ids, out=staging)
+        if self._staged_rows is None or self._staged_rows.shape[0] < n:
+            self._staged_rows = torch.empty(
+                (n, self._row_bytes), dtype=torch.uint8, device=device
+            )
+        self._staged_rows[:n].copy_(staging, non_blocking=True)
+        self._staged_count = n
+        return self._staged_rows[:n]
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        ids = row_ids.reshape(-1)
+        if ids.numel() == 0:
+            return torch.empty(0, self.head_dim, device=row_ids.device, dtype=self.dtype)
+
+        if self._staged_count == ids.numel():
+            # Host-side staged rows: consume the device buffer, no D2H / CPU gather.
+            # Stays valid for every PLE layer of this forward (shared table); the model
+            # invalidates it at the start of the next forward.
+            packed = self._staged_rows
+        else:
+            lo, hi = int(ids.min()), int(ids.max())
+            if lo < 0 or hi >= self.num_rows:
+                raise IndexError(
+                    f"PLE row id range [{lo}, {hi}] outside [0, {self.num_rows})"
+                )
+
+            # NGramEmbedding computes row ids on the GPU; the packed source rows
+            # live in the file mmap, so the gather runs on the CPU. This D2H sync
+            # replaces the old host-side id computation (correctness-first; an
+            # async pipeline can overlap it with the layer-0 work later).
+            ids_cpu = ids.to("cpu", non_blocking=False)
+
+            # Gather into a tiny pinned staging buffer: 16 rows/token * 90 bytes/row
+            # for the current IQ4_NL model. The ~29 GiB source remains file-backed.
+            staging = torch.empty(
+                (ids_cpu.numel(), self._row_bytes),
+                dtype=torch.uint8,
+                pin_memory=torch.cuda.is_available(),
+            )
+            torch.index_select(self._packed_rows, 0, ids_cpu, out=staging)
+            packed = staging.to(
+                device=row_ids.device,
+                non_blocking=staging.is_pinned(),
+            )
 
         if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
             try:
@@ -194,7 +241,7 @@ class GGUFPLETableBackend:
 
         if self._quant_type in GGML_UNQUANTIZED:
             raw_dtype = _DTYPE_FOR_GGML[self._quant_type]
-            values = staging.view(raw_dtype).to(device=row_ids.device, dtype=self.dtype)
+            values = packed.view(raw_dtype).to(device=row_ids.device, dtype=self.dtype)
         else:
             if row_ids.device.type != "cuda":
                 raise RuntimeError(
@@ -202,10 +249,6 @@ class GGUFPLETableBackend:
                 )
             from freetoken.kernel.gguf import ggml_dequantize
 
-            packed = staging.to(
-                device=row_ids.device,
-                non_blocking=staging.is_pinned(),
-            )
             values = ggml_dequantize(
                 packed,
                 self._quant_type,

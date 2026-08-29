@@ -209,6 +209,85 @@ class PinnedUVATable:
         return out
 
 
+def _shift_right_ignore_eos(tokens: torch.Tensor, shift: int, eos_token_id: int) -> torch.Tensor:
+    """Host-side: ``out[t]`` = token ``shift`` places left of ``t``, or eos across a boundary."""
+    if shift == 0:
+        return tokens
+    positions = torch.arange(tokens.numel(), dtype=torch.long)
+    eos_positions = torch.where(tokens == eos_token_id, positions, -1)
+    previous_eos_inclusive = torch.cummax(eos_positions, dim=0).values
+    previous_eos = torch.cat([eos_positions.new_full((1,), -1), previous_eos_inclusive[:-1]])
+    segment_start = previous_eos + 1
+    source_positions = positions - shift
+    shifted = tokens[source_positions.clamp_min(0)]
+    valid = (positions - segment_start >= shift) & (source_positions >= 0)
+    return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
+
+
+def build_ngram_ids(
+    tokens: torch.Tensor,
+    *,
+    ngram_size: int,
+    heads_per_ngram: int,
+    eos_token_id: int,
+    multipliers: torch.Tensor,
+    vocab_sizes: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Host-side ngram hash (mirrors ``NGramEmbedding.row_ids`` on the CPU)."""
+    tokens = tokens.to(dtype=torch.long, device="cpu")
+    shifted = [
+        _shift_right_ignore_eos(tokens, shift, eos_token_id) for shift in range(ngram_size)
+    ]
+    blocks = []
+    for ngram in range(2, ngram_size + 1):
+        start = (ngram - 2) * heads_per_ngram
+        stop = start + heads_per_ngram
+        mixed = shifted[0] * multipliers[0]
+        for position in range(1, ngram):
+            mixed = torch.bitwise_xor(mixed, shifted[position] * multipliers[position])
+        sizes = vocab_sizes[start:stop]
+        heads = torch.remainder(mixed.unsqueeze(-1), sizes)
+        blocks.append(heads + offsets[start:stop])
+    return torch.cat(blocks, dim=-1)
+
+
+def host_decode_ngram_ids(
+    emb: NGramEmbedding,
+    meta: PLEMetadata,
+    batch: Batch,
+) -> torch.Tensor:
+    """Host-computed [T, num_ngram_heads] int64 row ids for a decode forward.
+
+    Mirrors ``NGramEmbedding.row_ids(meta)`` on the CPU: each request's hash window is the
+    last ``ngram_size`` tokens of its host history (committed ``req.input_ids`` joined with
+    this forward's current token). Used to stage the GGUF PLE rows outside the forward so the
+    decode lookup is capture-safe and needs no D2H sync.
+    """
+    assert meta.is_decode
+    bs = len(batch.padded_reqs)
+    ids = meta.input_ids.detach().to("cpu", non_blocking=False)
+    pieces = []
+    off = 0
+    for req in batch.padded_reqs[:bs]:
+        # Host history ends with this forward's token(s): committed prefix + current token.
+        host = req.input_ids[: req.cached_len] if getattr(req, "cached_len", 0) else torch.empty(0, dtype=torch.int64)
+        cur = ids[off : off + req.extend_len]
+        history = torch.cat([host, cur]) if host.numel() else cur
+        all_ids = build_ngram_ids(
+            history,
+            ngram_size=emb.ngram_size,
+            heads_per_ngram=emb.heads_per_ngram,
+            eos_token_id=emb.eos_token_id,
+            multipliers=emb.layer_multipliers.cpu(),
+            vocab_sizes=emb.ngram_heads_vocab_sizes.cpu(),
+            offsets=emb.ngram_heads_offsets.cpu(),
+        )
+        pieces.append(all_ids[-req.extend_len :])
+        off += req.extend_len
+    return torch.cat(pieces, dim=0)
+
+
 def _splitmix64(value: int) -> int:
     value = (value + _SPLITMIX_GAMMA) & _MASK64
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64

@@ -15,18 +15,21 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+
+_logger = init_logger("freetoken.qwen4exp.model")
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -99,11 +102,42 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._ple_host_staged = False
 
     @property
     def ple_layers(self) -> List[PLELayer]:
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
+
+    def stage_ple_decode(self, batch: Batch, device: torch.device) -> None:
+        """Host-side PLE staging for a decode forward, run OUTSIDE the model forward.
+
+        Computes the ngram row ids on the host from each request's token history and gathers
+        the GGUF rows into the persistent device staging buffer (``GGUFPLETableBackend.stage``).
+        The in-forward ``lookup`` then only dequantizes that buffer (capture-safe, no D2H sync).
+        No-op unless ``FREETOKEN_PLE_HOST=1`` and the batch is a decode.
+        """
+        if not self._ple or not batch.is_decode:
+            return
+        if os.getenv("FREETOKEN_PLE_HOST", "0") != "1":
+            return
+        from .ple import build_ple_metadata, host_decode_ngram_ids
+
+        _emb = self._ple[0].ple_embedding
+        meta = build_ple_metadata(batch, self._ple[0].args, device)
+        _host_ids = host_decode_ngram_ids(_emb, meta, batch)
+        if os.getenv("FREETOKEN_PLE_HOST_VERIFY", "0") == "1" and not self._ple_host_staged:
+            # One-shot safety net: the per-step .to("cpu") sync would stall the scheduler
+            # loop (starving the detokenizer worker's keepalive), so only check the first
+            # decode step for host-vs-device id agreement.
+            _dev_ids = _emb.row_ids(meta).to("cpu", non_blocking=False)
+            self._ple_host_staged = True
+            if not torch.equal(_host_ids, _dev_ids):
+                _logger.warning(
+                    "PLE_HOST mismatch dev=%s host=%s",
+                    _dev_ids[0].tolist()[:4], _host_ids[0].tolist()[:4],
+                )
+        _emb.table.stage(_host_ids, device)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
@@ -112,6 +146,11 @@ class Qwen4ExpModel(BaseOP):
             from .ple import build_ple_metadata, commit_ngram_context
 
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
+            # The capture-safe decode path stages rows OUTSIDE the forward (stage_ple_decode
+            # from the engine, before replay). Any other path (prefill, non-host decode) must
+            # invalidate a stale staging so lookups never consume leftovers.
+            if not (os.getenv("FREETOKEN_PLE_HOST", "0") == "1" and batch.is_decode):
+                self._ple[0].ple_embedding.table._staged_count = 0
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
@@ -182,6 +221,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+
+    def stage_ple_decode(self, batch, device) -> None:
+        return self.model.stage_ple_decode(batch, device)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

@@ -940,6 +940,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        # Capture-safe PLE decode: stage the GGUF rows host-side BEFORE the forward/replay,
+        # so the in-graph lookup is device-only (the host staging must live outside capture).
+        _stage = getattr(self.model, "stage_ple_decode", None)
+        if _stage is not None and batch.is_decode:
+            _stage(batch, self.device)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)

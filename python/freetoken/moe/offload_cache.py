@@ -1412,10 +1412,13 @@ class OffloadMoeCache:
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if sys.platform == "win32":
-            pool = self._pending_geometry_pool
-            if (
-                pool is not None and not self._pending_geometry_prefill
-            ) or self._copy_fused_ok:
+            # The fused tvm-ffi multi-bank kernels now compile under MSVC (see
+            # kernel/csrc/jit/fast_index_copy.cuh), so stop forcing the pure-torch
+            # fallback for decode: fall through to the fused pool / fused-ok / legacy
+            # branches below, mirroring the non-Windows path. Keep the fallback only
+            # for the whole-layer prefill materialize (which the tests pin on the
+            # Windows copy helper).
+            if self._pending_geometry_prefill:
                 self._copy_missing_windows(layer_id)
                 return
         if self._pending_geometry_prefill:
