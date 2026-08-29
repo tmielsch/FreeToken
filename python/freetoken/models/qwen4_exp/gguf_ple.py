@@ -12,6 +12,7 @@ multi-GiB source stays file-backed.
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import torch
@@ -29,6 +30,10 @@ _DTYPE_FOR_GGML = {
     GGML_F16: torch.float16,
     GGML_BF16: torch.bfloat16,
 }
+
+
+def _perf() -> float:
+    return time.perf_counter()
 
 
 def _long_tuple(value) -> tuple[int, ...]:
@@ -161,8 +166,7 @@ class GGUFPLETableBackend:
         ``ids_host`` holds the raw CPU row ids for this step; rows are index-selected out of the
         file mmap into pinned memory and copied H2D into ``self._staged_rows``. The next
         ``lookup`` consumes them (device-only dequant, no D2H sync / no host work in the graph),
-        then the staging stays valid for every PLE layer of that forward. Returns the staged
-        device rows so callers can front-run the copy.
+        then clears the staging. Returns the staged device rows so callers can front-run the copy.
         """
         ids = ids_host.reshape(-1)
         n = int(ids.numel())
@@ -192,12 +196,14 @@ class GGUFPLETableBackend:
         ids = row_ids.reshape(-1)
         if ids.numel() == 0:
             return torch.empty(0, self.head_dim, device=row_ids.device, dtype=self.dtype)
+        _t0 = _perf()
 
         if self._staged_count == ids.numel():
             # Host-side staged rows: consume the device buffer, no D2H / CPU gather.
-            # Stays valid for every PLE layer of this forward (shared table); the model
-            # invalidates it at the start of the next forward.
+            # The staging stays valid for every PLE layer of this forward (shared table);
+            # model.forward invalidates it at the start of the next forward.
             packed = self._staged_rows
+            _t1 = _t2 = _t3 = _t0
         else:
             lo, hi = int(ids.min()), int(ids.max())
             if lo < 0 or hi >= self.num_rows:
@@ -210,6 +216,7 @@ class GGUFPLETableBackend:
             # replaces the old host-side id computation (correctness-first; an
             # async pipeline can overlap it with the layer-0 work later).
             ids_cpu = ids.to("cpu", non_blocking=False)
+            _t1 = _perf()
 
             # Gather into a tiny pinned staging buffer: 16 rows/token * 90 bytes/row
             # for the current IQ4_NL model. The ~29 GiB source remains file-backed.
@@ -219,10 +226,12 @@ class GGUFPLETableBackend:
                 pin_memory=torch.cuda.is_available(),
             )
             torch.index_select(self._packed_rows, 0, ids_cpu, out=staging)
+            _t2 = _perf()
             packed = staging.to(
                 device=row_ids.device,
                 non_blocking=staging.is_pinned(),
             )
+            _t3 = _perf()
 
         if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
             try:
@@ -256,6 +265,22 @@ class GGUFPLETableBackend:
                 self.head_dim,
                 self.dtype,
             )
+            if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+                try:
+                    from freetoken.utils.logger import init_logger
+
+                    _log = init_logger("freetoken.qwen4exp.ple")
+                    _log.info(
+                        "PLELOOK n=%d ids_ms=%.3f gather_ms=%.3f h2d_ms=%.3f dequant_ms=%.3f staged=%d",
+                        ids.numel(),
+                        (_t1 - _t0) * 1e3,
+                        (_t2 - _t1) * 1e3,
+                        (_t3 - _t2) * 1e3,
+                        (_perf() - _t3) * 1e3,
+                        1 if (_t1 == _t0 and _t2 == _t0 and _t3 == _t0) else 0,
+                    )
+                except Exception:  # pragma: no cover
+                    pass
 
         values = values.reshape(*row_ids.shape[:-1], -1)
         if out is None:

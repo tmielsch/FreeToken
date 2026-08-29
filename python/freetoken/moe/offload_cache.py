@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
+
+
+def _perf() -> float:
+    return time.perf_counter()
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -310,6 +315,7 @@ class OffloadMoeCache:
         self._geometry_pool_for_layer: dict[int, _GeometryPoolState] = {}
         self._pending_geometry_pool: _GeometryPoolState | None = None
         self._pending_geometry_prefill = False
+        self._pending_prefill_ids: torch.Tensor | None = None
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -1103,11 +1109,12 @@ class OffloadMoeCache:
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
 
-    def materialize_layer(self, layer_id: int) -> None:
+    def materialize_layer(self, layer_id: int, ids: torch.Tensor | None = None) -> None:
         from freetoken.moe.offload_kernels import materialize_layer, reset_cache
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        self._pending_prefill_ids = ids
         if self._geometry_pools:
             for pool in self._geometry_pools:
                 reset_cache(pool)
@@ -1316,27 +1323,58 @@ class OffloadMoeCache:
         and the legacy unified-cache miss copy.
         """
         if self._pending_geometry_prefill:
-            n_valid = self.num_experts
-            for per_layer, cache in self.banks:
-                src = per_layer[layer_id]
-                if src.shape[0] < n_valid or cache.shape[0] < n_valid:
-                    raise RuntimeError(
-                        f"_copy_missing_windows geom-prefill OOB layer={layer_id} "
-                        f"src_rows={src.shape[0]} cache_rows={cache.shape[0]} n_valid={n_valid}"
+            routed = self._pending_prefill_ids
+            n_valid = self.num_experts if routed is None else int(routed.reshape(-1).numel())
+            _pf_t0 = _perf()
+            if routed is not None:
+                routed = routed.reshape(-1).long()
+                if routed.numel() == 0:
+                    self._pending_prefill_ids = None
+                    return
+                routed_cpu = routed.to("cpu", non_blocking=False)
+                for per_layer, cache in self.banks:
+                    src = per_layer[layer_id]
+                    if int(routed.max()) >= src.shape[0] or int(routed.max()) >= cache.shape[0]:
+                        raise RuntimeError(
+                            f"_copy_missing_windows geom-prefill routed OOB layer={layer_id} "
+                            f"maxid={int(routed.max())} src_rows={src.shape[0]} cache_rows={cache.shape[0]}"
+                        )
+                    sel = src.index_select(0, routed_cpu)
+                    if sel.shape[1] > cache.shape[1]:
+                        raise RuntimeError(
+                            f"_copy_missing_windows geom-prefill routed col-OOB layer={layer_id} "
+                            f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
+                        )
+                    cache[:, : sel.shape[1]].index_copy_(
+                        0, routed, sel.to(cache.device, non_blocking=True)
                     )
-                sel = src[:n_valid]
-                if sel.shape[1] > cache.shape[1]:
-                    raise RuntimeError(
-                        f"_copy_missing_windows geom-prefill col-OOB layer={layer_id} "
-                        f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
-                    )
-                if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
-                    logger.info(
-                        "MOECACHE geom_prefill layer=%d n_valid=%d dst_rows=%d src_cols=%d into=%s",
-                        layer_id, n_valid, cache.shape[0], sel.shape[1],
-                        tuple(c.shape for c in (cache,)),
-                    )
-                cache[:n_valid, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
+            else:
+                for per_layer, cache in self.banks:
+                    src = per_layer[layer_id]
+                    if src.shape[0] < n_valid or cache.shape[0] < n_valid:
+                        raise RuntimeError(
+                            f"_copy_missing_windows geom-prefill OOB layer={layer_id} "
+                            f"src_rows={src.shape[0]} cache_rows={cache.shape[0]} n_valid={n_valid}"
+                        )
+                    sel = src[:n_valid]
+                    if sel.shape[1] > cache.shape[1]:
+                        raise RuntimeError(
+                            f"_copy_missing_windows geom-prefill col-OOB layer={layer_id} "
+                            f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
+                        )
+                    if os.path.exists(r"D:\temp\opencode\ft_debug_logits.flag"):
+                        logger.info(
+                            "MOECACHE geom_prefill layer=%d n_valid=%d dst_rows=%d src_cols=%d into=%s",
+                            layer_id, n_valid, cache.shape[0], sel.shape[1],
+                            tuple(c.shape for c in (cache,)),
+                        )
+                    cache[:n_valid, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
+            if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+                try:
+                    logger.info("PREFCOP layer=%d n=%d ms=%.1f", layer_id, n_valid, (_perf() - _pf_t0) * 1e3)
+                except Exception:  # pragma: no cover
+                    pass
+            self._pending_prefill_ids = None
             return
 
         pool = self._pending_geometry_pool
@@ -1422,6 +1460,18 @@ class OffloadMoeCache:
                 self._copy_missing_windows(layer_id)
                 return
         if self._pending_geometry_prefill:
+            routed = self._pending_prefill_ids
+            self._pending_prefill_ids = None
+            if routed is not None:
+                routed = routed.reshape(-1).long()
+                routed_cpu = routed.to("cpu", non_blocking=False)
+                for per_layer, cache in self.banks:
+                    src = per_layer[layer_id]
+                    sel = src.index_select(0, routed_cpu)
+                    cache[:, : sel.shape[1]].index_copy_(
+                        0, routed, sel.to(cache.device, non_blocking=True)
+                    )
+                return
             for per_layer, cache in self.banks:
                 self._copy_compact_layer(
                     cache[: self.num_experts],

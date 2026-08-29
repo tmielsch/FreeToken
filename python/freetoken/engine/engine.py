@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -940,6 +941,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        _st_t0 = time.perf_counter()
         # Capture-safe PLE decode: stage the GGUF rows host-side BEFORE the forward/replay,
         # so the in-graph lookup is device-only (the host staging must live outside capture).
         _stage = getattr(self.model, "stage_ple_decode", None)
@@ -954,11 +956,39 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        _st_t1 = time.perf_counter()
 
         for req in batch.reqs:
             req.complete_one()
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                _st_t2 = time.perf_counter()
+                _n = batch.reqs[0].input_ids.numel() if batch.reqs else 0
+                logger.info(
+                    "STEPTIM decode=%s size=%d model_ms=%.1f complete_ms=%.1f ntok=%d",
+                    batch.is_decode, len(batch.reqs),
+                    (_st_t1 - _st_t0) * 1e3, (_st_t2 - _st_t1) * 1e3, _n,
+                )
+            except Exception:  # pragma: no cover
+                pass
 
         batch_logits = logits[: batch.size]
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                for r_i, req in enumerate(batch.reqs[: batch.size]):
+                    lg = batch_logits[r_i]
+                    lg_f = lg.float()
+                    top = torch.topk(lg_f, 5)
+                    lse = torch.logsumexp(lg_f, dim=-1)
+                    tail = req.input_ids[-8:].tolist() if req.input_ids.numel() else []
+                    logger.info(
+                        "LOGIT row=%d decode=%s ntok=%d tail=%s top=%s probs_p=%s",
+                        r_i, batch.is_decode, req.input_ids.numel(), tail,
+                        top.indices.tolist(),
+                        [f"{float(p):.3f}" for p in torch.exp(top.values - lse).tolist()],
+                    )
+            except Exception:  # pragma: no cover
+                pass
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()

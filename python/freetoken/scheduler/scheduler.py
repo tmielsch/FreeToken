@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+
+_last_step_wall: list[float] = [0.0]
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
@@ -231,6 +235,7 @@ class Scheduler(SchedulerIOMixin):
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
         ongoing_data = None
+        _sched_t0 = time.perf_counter()
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
@@ -248,6 +253,16 @@ class Scheduler(SchedulerIOMixin):
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
         self._flush_abort_acks()
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                _pref = forward_input is not None and forward_input.batch.is_prefill
+                _now = time.perf_counter()
+                _gap = (_now - _last_step_wall[0]) * 1e3 if _last_step_wall[0] else 0.0
+                if not _pref:
+                    _last_step_wall[0] = _now
+                    logger.info("SCHEDWALL decode=%s wall_ms=%.1f gap_ms=%.1f", (not _pref), (_now - _sched_t0) * 1e3, _gap)
+            except Exception:  # pragma: no cover
+                pass
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -269,6 +284,7 @@ class Scheduler(SchedulerIOMixin):
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
+        _sched_t0 = time.perf_counter()
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
@@ -276,6 +292,12 @@ class Scheduler(SchedulerIOMixin):
 
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag") and forward_input is not None:
+            try:
+                _pref = forward_input.batch.is_prefill
+                logger.info("SCHEDWALL decode=%s wall_ms=%.1f", (not _pref), (time.perf_counter() - _sched_t0) * 1e3)
+            except Exception:  # pragma: no cover
+                pass
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:

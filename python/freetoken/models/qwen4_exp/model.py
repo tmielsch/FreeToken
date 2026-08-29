@@ -16,6 +16,7 @@ immediate combine::
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -29,11 +30,19 @@ from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 
-_logger = init_logger("freetoken.qwen4exp.model")
-
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+_model_logger = init_logger("freetoken.qwen4exp.model")
+
+
+def _prof_on() -> bool:
+    return os.path.exists(r"D:\temp\opencode\ft_steptime.flag")
+
+
+def _t() -> float:
+    return time.perf_counter()
 
 
 def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
@@ -74,19 +83,38 @@ class Qwen4ExpDecoderLayer(BaseOP):
         self.ple = (
             PLELayer(config, layer_id) if layer_id in config.qwen4_args.ple_layer_ids else None
         )
+        self._prof_acc: dict[str, float] | None = None
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        prof = _prof_on()
+        if prof and self._prof_acc is None:
+            self._prof_acc = {"ple": 0.0, "attn": 0.0, "mlp": 0.0, "hc": 0.0}
+        acc = self._prof_acc
+        t0 = _t() if prof else None
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
+        t1 = _t() if prof else None
         block_input, inject = self.attn_hyper_connection.mix(hidden)
+        t2 = _t() if prof else None
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
+        t3 = _t() if prof else None
         hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        t4 = _t() if prof else None
         block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        blk = self.mlp.forward(block_input)
+        t5 = _t() if prof else None
+        out = self.mlp_hyper_connection.combine(hidden, blk, inject)
+        t6 = _t() if prof else None
+        if acc is not None:
+            acc["ple"] += t1 - t0
+            acc["attn"] += t3 - t2
+            acc["mlp"] += t5 - t4
+            acc["hc"] += (t2 - t1) + (t4 - t3) + (t6 - t5)
+        return out
 
 
 class Qwen4ExpModel(BaseOP):
@@ -102,7 +130,7 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
-        self._ple_host_staged = False
+        self._ple_host_verified = False
 
     @property
     def ple_layers(self) -> List[PLELayer]:
@@ -110,8 +138,7 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def stage_ple_decode(self, batch: Batch, device: torch.device) -> None:
-        """Host-side PLE staging for a decode forward, run OUTSIDE the model forward.
-
+        """Host-side PLE staging for a decode forward, run OUTSIDE the graph/model forward.
         Computes the ngram row ids on the host from each request's token history and gathers
         the GGUF rows into the persistent device staging buffer (``GGUFPLETableBackend.stage``).
         The in-forward ``lookup`` then only dequantizes that buffer (capture-safe, no D2H sync).
@@ -126,17 +153,19 @@ class Qwen4ExpModel(BaseOP):
         _emb = self._ple[0].ple_embedding
         meta = build_ple_metadata(batch, self._ple[0].args, device)
         _host_ids = host_decode_ngram_ids(_emb, meta, batch)
-        if os.getenv("FREETOKEN_PLE_HOST_VERIFY", "0") == "1" and not self._ple_host_staged:
-            # One-shot safety net: the per-step .to("cpu") sync would stall the scheduler
-            # loop (starving the detokenizer worker's keepalive), so only check the first
+        if os.getenv("FREETOKEN_PLE_HOST_VERIFY", "0") == "1" and not self._ple_host_verified:
+            # One- shot safety net: the per-step .to("cpu") sync stalls the scheduler loop
+            # enough to starve the detokenizer worker's keepalive, so only check the first
             # decode step for host-vs-device id agreement.
             _dev_ids = _emb.row_ids(meta).to("cpu", non_blocking=False)
-            self._ple_host_staged = True
+            self._ple_host_verified = True
             if not torch.equal(_host_ids, _dev_ids):
-                _logger.warning(
+                _model_logger.warning(
                     "PLE_HOST mismatch dev=%s host=%s",
                     _dev_ids[0].tolist()[:4], _host_ids[0].tolist()[:4],
                 )
+            else:
+                _model_logger.info("PLE_HOST verified: host ngram ids match the device reference.")
         _emb.table.stage(_host_ids, device)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
@@ -146,11 +175,12 @@ class Qwen4ExpModel(BaseOP):
             from .ple import build_ple_metadata, commit_ngram_context
 
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
+            _tbl = self._ple[0].ple_embedding.table
             # The capture-safe decode path stages rows OUTSIDE the forward (stage_ple_decode
             # from the engine, before replay). Any other path (prefill, non-host decode) must
             # invalidate a stale staging so lookups never consume leftovers.
             if not (os.getenv("FREETOKEN_PLE_HOST", "0") == "1" and batch.is_decode):
-                self._ple[0].ple_embedding.table._staged_count = 0
+                _tbl._staged_count = 0
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
@@ -159,6 +189,22 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if _prof_on():
+            try:
+                acc = {"ple": 0.0, "attn": 0.0, "mlp": 0.0, "hc": 0.0}
+                for layer in self.layers.op_list:
+                    if layer._prof_acc is not None:
+                        for k in acc:
+                            acc[k] += layer._prof_acc[k]
+                        layer._prof_acc = None
+                total = sum(acc.values())
+                _model_logger.info(
+                    "MODELPROF total_ms=%.1f ple_ms=%.1f attn_ms=%.1f mlp_ms=%.1f hc_ms=%.1f",
+                    total * 1e3, acc["ple"] * 1e3, acc["attn"] * 1e3,
+                    acc["mlp"] * 1e3, acc["hc"] * 1e3,
+                )
+            except Exception:  # pragma: no cover
+                pass
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 

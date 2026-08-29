@@ -234,7 +234,7 @@ def build_ngram_ids(
     vocab_sizes: torch.Tensor,
     offsets: torch.Tensor,
 ) -> torch.Tensor:
-    """Host-side ngram hash (mirrors ``NGramEmbedding.row_ids`` on the CPU)."""
+    """Host-side ngram hash (HF-identical; mirrors ``NGramEmbedding.row_ids`` on the CPU)."""
     tokens = tokens.to(dtype=torch.long, device="cpu")
     shifted = [
         _shift_right_ignore_eos(tokens, shift, eos_token_id) for shift in range(ngram_size)
@@ -262,7 +262,7 @@ def host_decode_ngram_ids(
     Mirrors ``NGramEmbedding.row_ids(meta)`` on the CPU: each request's hash window is the
     last ``ngram_size`` tokens of its host history (committed ``req.input_ids`` joined with
     this forward's current token). Used to stage the GGUF PLE rows outside the forward so the
-    decode lookup is capture-safe and needs no D2H sync.
+    in-graph lookup is capture-safe and needs no D2H sync.
     """
     assert meta.is_decode
     bs = len(batch.padded_reqs)

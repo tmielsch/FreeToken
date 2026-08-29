@@ -1,4 +1,5 @@
 import os
+import time
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -13,6 +14,10 @@ from .base import BaseOP
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+def _moe_perf() -> float:
+    return time.perf_counter()
 
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
 # is computed outside the MoE layer. Such models call ``routed_forward`` (offload) or
@@ -309,9 +314,12 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        _moe_t0 = _moe_perf()
         cache.ensure_experts(self.layer_id, topk_ids)
+        _moe_t1 = _moe_perf()
         cache.copy_missing()
-        return self._expert_gemm(
+        _moe_t2 = _moe_perf()
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -321,6 +329,20 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                from freetoken.utils.logger import init_logger
+
+                init_logger("freetoken.layers.moe").info(
+                    "MOEPROF layer=%d ensure_ms=%.1f copy_ms=%.1f gemm_ms=%.1f",
+                    self.layer_id,
+                    (_moe_t1 - _moe_t0) * 1e3,
+                    (_moe_t2 - _moe_t1) * 1e3,
+                    (_moe_perf() - _moe_t2) * 1e3,
+                )
+            except Exception:  # pragma: no cover
+                pass
+        return out
 
     def _decode_hybrid(
         self,
@@ -397,7 +419,10 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
-        cache.materialize_layer(self.layer_id)
+        if os.getenv("FREETOKEN_PREFILL_ROUTED", "0") == "1":
+            cache.materialize_layer(self.layer_id, ids=topk_ids)
+        else:
+            cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(
             cache,

@@ -123,6 +123,7 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        self.model = model
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -178,6 +179,19 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
+            # PLE capture-safety (GGUF path): stage the ngram rows host-side on the graph
+            # stream BEFORE capture, so the in-graph lookup dequantizes a fixed device buffer.
+            _stage = getattr(self.model, "stage_ple_decode", None)
+            if _stage is not None:
+                try:
+                    _stage(batch, self.device)
+                except Exception:  # noqa: BLE001 -- capture probes the eager fallback
+                    import traceback
+
+                    logger.error(
+                        "PLE capture staging failed for bs=%d (capture will use the eager "
+                        "fallback and likely be invalid): %s", bs, traceback.format_exc(),
+                    )
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces

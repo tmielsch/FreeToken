@@ -8,6 +8,10 @@ per row geometry. Qwen4Exp only supplies its per-layer ggml types and expert ban
 
 from __future__ import annotations
 
+import os
+
+import torch
+
 from freetoken.layers.moe import OffloadMoELayer
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -150,6 +154,26 @@ class Qwen4ExpGGUFForCausalLM(Qwen4ExpForCausalLM):
         self._ple_table = table  # owns the GGUF readers; keep the mmap alive
         for ple in ple_layers:
             ple.ple_embedding.attach_table(table)
+        if os.environ.get("FREETOKEN_PLE_ZERO", "0") == "1":
+            # A/B isolation: feed the PLE layer zero embeddings (hash constants keep real
+            # vocab sizes so no div-by-zero) to see whether PLE causes the decode loop.
+            from .ple import derive_ngram_hash_constants
+
+            for ple in ple_layers:
+                args = ple.args
+                mult, sizes, offsets = derive_ngram_hash_constants(
+                    vocab_size=self._config.vocab_size,
+                    ngram_size=args.ngram_size,
+                    num_ngram_heads=args.num_ngram_heads,
+                    ngram_vocab_size_base=args.ngram_vocab_size_base,
+                    ple_layer_index=ple.ple_index,
+                )
+                emb = ple.ple_embedding
+                emb.layer_multipliers.copy_(torch.tensor(mult, dtype=torch.int64))
+                emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
+                emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
+                emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            return 0
         return 0
 
 

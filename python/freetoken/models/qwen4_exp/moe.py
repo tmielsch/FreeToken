@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -10,6 +12,10 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+def _t() -> float:
+    return time.perf_counter()
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -36,11 +42,28 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        _t0 = _t()
         router_logits = self.gate.forward(hidden_states)
+        _t1 = _t()
         shared = self.shared_expert.forward(hidden_states)
+        _t2 = _t()
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        _t3 = _t()
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
-        return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
+        _t4 = _t()
+        out = shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                from freetoken.utils.logger import init_logger
+
+                init_logger("freetoken.qwen4exp.moe").info(
+                    "MOESPLIT router_ms=%.1f shared_ms=%.1f sgate_ms=%.1f routed_ms=%.1f mul_ms=%.1f",
+                    (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3, (_t3 - _t2) * 1e3,
+                    (_t4 - _t3) * 1e3, (time.perf_counter() - _t4) * 1e3,
+                )
+            except Exception:  # pragma: no cover
+                pass
+        return out
 
 
 __all__ = ["Qwen4ExpMoE"]
