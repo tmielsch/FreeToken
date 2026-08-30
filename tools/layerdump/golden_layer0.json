@@ -1,0 +1,38 @@
+{
+  "prompt": "div15 (Count down from 5 to 1, one number per line, no extra text.)",
+  "tokens": 18,
+  "model": "Qwen3.8-Flash-Next-UD-Q3_K_XL-merged.gguf",
+  "date": "2026-08-30",
+  "layer0": {
+    "embed_llama_vs_free_dequant": "bit-exact (rel 0.0; Q8_0 token_embd dequant == llama layer_000)",
+    "stage_rel_free_vs_llama_cpu": {
+      "attn_in": 0.0113,
+      "attn_out": 0.0185,
+      "mlp_in": 0.0246,
+      "mlp_out": 0.3016,
+      "layer": 0.2485
+    },
+    "stage_rel_free_vs_llama_cpu_with_f32_dense": {
+      "attn_in": 0.0026,
+      "attn_out": 0.0047,
+      "mlp_in": 0.0086,
+      "mlp_out": 0.2987,
+      "layer": 0.2439
+    },
+    "dense_fp64_replay": {
+      "fp64_vs_llama_attn_in": 0.0112,
+      "q8_1_activation_replay_vs_llama_attn_in": 0.0001,
+      "fp64_vs_freetoken_attn_in": 0.00256
+    },
+    "moe_router_stage1": {
+      "mlp_in_rel": 0.0246,
+      "router_logits_rel": 0.0039,
+      "softmax_prob_rel": 7e-05,
+      "top1_overlap": 1.0,
+      "top4_overlap": 1.0,
+      "top8_overlap": 0.986,
+      "note": "router weight is F32; routing identical => mlp_out difference is expert-GEMM numerics (llama-CPU fp32-dequant vs FreeToken/llama-GPU ggml_moe_a8_vec q8_1)"
+    }
+  },
+  "conclusion": "per-layer divergence enters at layer 0, length-independent; dominated by llama-CPU-specific numerics (Q8_0 activation quantization in dense GEMMs + fp32-dequant MoE instead of a8/q8_1). FreeToken matches the canonical fp64 path and shares llama's a8 MoE kernel; expected to match real llama-GPU to noise. Full-GPU proof blocked by 16GB VRAM vs 83.8GB model."
+}
