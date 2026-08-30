@@ -24,34 +24,37 @@ fp32-clean, so the open question was: which decoder layer first diverges with RE
 - **Harness/analysis** — `layerdump_harness.py` (free/llama/diff), offline fp64 replays on real
   GGUF Q8_0 bytes (`replay_hc_mix.py`, `replay_mix_alllayers.py`).
 
-## Finding (mechanically proven)
+## Finding (mechanically proven, updated 2026-08-30)
 
-**The divergence enters at layer 0 and is length-independent; it has two sources.**
+**The loop-divergence root cause is a REAL FreeToken bug: the routed-MoE top-10 router weights
+are not renormalized on the GGUF path.** Qwen MoE (`norm_topk_prob=True`, llama.cpp qwen4exp
+hardcodes `norm_w=true`) rescales the selected top-k softmax weights to sum to 1; FreeToken's
+GGUF parse set `norm_topk_prob=False`, so its routed contribution was systematically ~2–6× too
+small (softmax top-10 sums to ~0.29 on average ⇒ factor ~3.7). This skewed `mlp_out` at every
+layer (and, through the shared-expert add, the whole decoder), producing the observed first-token
+divergence and the generation loop.
 
-1. **Secondary — llama.cpp quantizes f32 activations to Q8_0 in the dense GGUF GEMMs (HC/GDN).**
-   A fp64 replay of the layer-0 HC mix on llama's own weights/input matches llama to **rel 1e-4
-   only when the f32 activation is Q8_0-quantized per 32-block before each GEMM**; plain fp32 is
-   1.1% off. Source: `ggml/src/ggml-cpu/ggml-cpu.c` `ggml_compute_forward_mul_mat`
-   (`vec_dot_type`=Q8_0 ⇒ `quantize_row_q8_0` applied to the f32 activation). `GGML_PREC_F32` is
-   a no-op on CPU. FreeToken computes these in fp32 (matches the canonical fp64 replay to 0.26%).
-   A new `f32_dense_mm` cparam (`build_lora_mm` casts Q8_0→F32 via `ggml_cast`) closes this:
-   layer-0 `attn_in` drops 1.1% → 0.3%.
-2. **DOMINANT — the MoE block output (`mlp_out`).** Even after the dense-path fix, `mlp_out`
-   stays ~30% relative (abs ~0.013 ≈ 4× the input error) at layer 0, length-independent (3/4/18
-   tokens), and it propagates: residual rel grows 0.25 → 0.75 over layers 0..47 (~100× depth
-   amplification), which is what produces the 9–14 logprob delta.
-   **Correction after code review (verified with the reviewer's finding):** the routed-MoE path
-   does **not** use a BF16-dequant+torch-GEMM. `fmt=="gguf"` (layers/moe.py:619) → `fused_experts_gguf`
-   → `ggml_moe_a8_vec` (`kernel/csrc/gguf/gguf_kernel.cu:566-568`), which quantizes the activation
-   to **Q8_1 itself** — the *same* kernel llama.cpp uses. The BF16 fallback (moe.py:588) only
-   handles genuinely-BF16 experts (not this checkpoint). So FreeToken-GPU and llama-GPU share the
-   a8/Q8_1 expert numerics, and the ~30% against our llama-**CPU** reference is most plausibly a
-   CPU-vs-GPU reference artifact (llama-CPU dequantizes experts to fp32 without a8) and/or a
-   routing/assembly difference — to be tested against llama-GPU (which the GUI already uses, `-ngl 99`).
+Evidence (layer 0, 18-token div15, real GGUF bytes; scripts in `tools/layerdump/`):
+- **Decomposition**: `shared` expert output free-vs-llama rel = 0.007 (matches; only the 2.5%
+  `mlp_in` diff propagates); `routed` rel = 0.716, with **routed signal rms 0.0056 (free) vs
+  0.0186 (llama)** — llama's routed part is ~3.3× larger.
+- **Per-token routed ratio `routed_llama/routed_free`** `[5.78, 3.36, 2.28, ...]` matches the
+  per-token renormalization factor `1/sum(top10 softmax)` `[5.76, 3.34, 2.26, ...]` almost exactly.
+- **Fix reconstruction**: `shared + routed × (1/sum(top10))` reproduces llama's `mlp_out` to
+  **rel 0.015** (vs 0.302 raw). => the entire 30% `mlp_out` gap is the missing renormalization.
+- **Acceptance after fix** (`gguf.py` → `norm_topk_prob=True`, + regression test): div15 first-token
+  top-1 id 271 lnprobs −0.085 vs llama-CPU −0.185 (±0.10, was ±1.39); 9/10 shared top-10 ids; max
+  shared-id delta 1.48 (was 2.3). Greedy generation no longer repeats (dup_frac 0, proper countdown);
+  default-sampling runs produce sane text with no degenerate loop.
 
-Neither is a FreeToken bug — the CPU-reference differences come from llama.cpp/ggml numerical-path
-behaviors that a fp32-clean FreeToken cannot reproduce exactly; the GPU-vs-GPU baseline is the
-acceptance target.
+Secondary/reference-path observations (kept for context):
+- llama.cpp **CPU** Q8_0 dense GEMMs quantize the f32 activation to Q8_0 (ggml `mul_mat`, ~1% per
+  dense GEMM; `GGML_PREC_F32` is a CPU no-op). FreeToken is fp32-clean there; a `f32_dense_mm`
+  A/B lever (`build_lora_mm` casts Q8_0→F32) closes layer-0 `attn_in` 1.1% → 0.3%. This is a
+  llama-CPU-only artifact and NOT the loop driver.
+- Routed-MoE expert compute uses the **shared `ggml_moe_a8_vec` kernel** (Q8_1 activation) on
+  FreeToken-GPU and llama-GPU alike — its numerics match by construction (bit-identical test
+  `dd7aaf2`). Remaining small residual after the fix is expert-numerics/CPU-vs-GPU noise.
 
 ## Reproduce / extend
 
@@ -67,23 +70,20 @@ python D:\temp\opencode\layerdump\layerdump_harness.py free --prompt-name div15 
 
 ## Open questions / next steps (good for review input)
 
-**Stage-1 router A/B already resolved (no new captures needed, from the saved `mlp_in` states):**
-at layer 0 the router logits agree (rel 0.39%, F32 router weight) and **top-1/top-4 expert
-selection is identical (overlap 1.0)** — so the layer-0 `mlp_out` 30% is **not** a routing flip.
-Deep layers (≥20) do diverge in routing, but only because the compounded residual drift (mlp_in
-~10%) flips top-k — a consequence, not the root cause. Remaining explanation for layer 0: expert
-GEMM numerics (llama-CPU fp32-dequant experts vs FreeToken's shared a8/q8_1 kernel).
-
-1. **Definition / proof options for "expert GEMM numerics (CPU-vs-GPU)"**:
-   - Run a true full-GPU llama (a8 MoE + f32 dense) — blocked here by 16 GB VRAM vs 83.8 GB model.
-   - Offline stage-2/3 replay: dequant the selected IQ3_XXS/IQ4_XS/IQ4_NL expert weights to fp32
-     and replay (a) fp32 and (b) q8_1-activation trajectories against the captured `mlp_out`.
-   This distinguishes activation-rounding magnitude from an output-scale/assembly bug.
-2. **Review verdict followed:** do NOT chase llama-CPU bit-numerics; target qualitative
-   equivalence vs llama-**GPU** (which the GUI already uses). Whether llama/ggml should instead
-   match the canonical fp32 path on CPU remains a llama.cpp-side question.
-3. Historical "9–14 logprob" band is not reproduced by shared top-10 deltas (~2–3 at div15);
-   worth re-deriving the original metric before treating it as ground truth.
+The review's finding on top-k was correct and is now the committed fix:
+- **Stage-1 (top-10, exact `fused_topk` semantics):** top-10 IDs match; the missing
+  **renormalization** of the top-10 weights is the whole `mlp_out` gap (see Finding).
+- **`mlp_out` ≠ routed-MoE:** confirmed — it is `routed + shared·sigmoid(gate)`. Decomposition
+  shows `shared` matches (rel 0.007) and the entire gap sits in `routed` (renorm factor match
+  1/sum(top10), reconstruction rel 0.015).
+- **Prefill-vs-decode invariance test (review priority 1):** designed (`invariance_test.py`).
+  Blocked on the HTTP path: FreeToken OpenAI API rejects token-id prompts ("pass text prompt
+  strings instead") and text-join of a greedy continuation does not re-tokenize identically.
+  Next step: drive the model in-process (exact ids) with a prefill-vs-incremental-decode harness
+  to confirm the decode-state rollforward (GDN/PLE/KV) reproduces the full-prefill states —
+  now that the routing-weight scale is fixed, this is the remaining generation-side check.
+- **After invariance PASS:** stage-2/3 selected-expert replay (Layer 0, 1 token, 10 experts)
+  exclusively to quantify the a8/q8_1-vs-fp32 rounding magnitude (CPU-vs-GPU reference noise).
 
 ## Artifacts
 

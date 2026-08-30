@@ -21,18 +21,30 @@
     },
     "dense_fp64_replay": {
       "fp64_vs_llama_attn_in": 0.0112,
-      "q8_1_activation_replay_vs_llama_attn_in": 0.0001,
+      "q8_0_activation_replay_vs_llama_attn_in": 0.0001,
       "fp64_vs_freetoken_attn_in": 0.00256
     },
-    "moe_router_stage1": {
-      "mlp_in_rel": 0.0246,
-      "router_logits_rel": 0.0039,
-      "softmax_prob_rel": 7e-05,
-      "top1_overlap": 1.0,
-      "top4_overlap": 1.0,
-      "top8_overlap": 0.986,
-      "note": "router weight is F32; routing identical => mlp_out difference is expert-GEMM numerics (llama-CPU fp32-dequant vs FreeToken/llama-GPU ggml_moe_a8_vec q8_1)"
+    "moe_decomposition": {
+      "shared_rel_free_vs_llama": 0.007,
+      "routed_rel_free_vs_llama": 0.7157,
+      "routed_rms_free": 0.0056,
+      "routed_rms_llama": 0.0186,
+      "mlp_out_is_routed_plus_shared_sigmoid_gate": true
+    },
+    "moe_renorm_factor": {
+      "top10_softmax_sum_mean": 0.289,
+      "renorm_factor_mean_1_over_sum": 3.665,
+      "routed_ratio_llama_over_free_per_token": [5.78, 3.36, 2.28, 2.44, 3.89, 2.82, 2.83, 4.47, 3.28, 3.74, 3.51, 4.25, 4.57, 4.33, 3.69, 3.7, 4.91, 2.63],
+      "renorm_factor_per_token": [5.76, 3.34, 2.26, 2.44, 3.89, 2.81, 2.84, 4.4, 3.26, 3.69, 3.49, 4.19, 4.5, 4.34, 3.64, 3.68, 4.81, 2.63],
+      "reconstruct_shared_plus_routed_times_1_over_sum_vs_llama_mlp_out_rel": 0.0154
+    },
+    "fix": {
+      "change": "gguf.py parse_gguf_config norm_topk_prob False -> True (llama norm_w=true)",
+      "lane": "first token top1 271 lnp -0.085 vs llama -0.185 (was -1.54)",
+      "max_shared_id_delta": 1.48,
+      "shared_top10_ids": "9 of 10",
+      "greedy_dup_frac": 0.0
     }
   },
-  "conclusion": "per-layer divergence enters at layer 0, length-independent; dominated by llama-CPU-specific numerics (Q8_0 activation quantization in dense GEMMs + fp32-dequant MoE instead of a8/q8_1). FreeToken matches the canonical fp64 path and shares llama's a8 MoE kernel; expected to match real llama-GPU to noise. Full-GPU proof blocked by 16GB VRAM vs 83.8GB model."
+  "conclusion": "The dominant loop/first-token divergence is a REAL FreeToken bug: the GGUF path does not renormalize the top-10 router weights (norm_topk_prob=False) while llama.cpp renormalizes (norm_w=true) and the HF model uses norm_topk_prob=True. FreeToken's routed contribution was ~2-6x too small (factor 1/sum(top10) ~3.7). Fix = norm_topk_prob=True (committed + regression test). Secondary CPU-only artifacts (dense Q8_0 activation quantization; MoE a8/q8_1 vs fp32) remain and are llama-CPU-reference-specific."
 }

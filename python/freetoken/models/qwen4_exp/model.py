@@ -53,6 +53,14 @@ def _hidden_dump_on() -> bool:
     return os.path.exists(r"D:\temp\opencode\ft_hidden_dump.flag")
 
 
+def _hidden_dump_decode_on() -> bool:
+    """Decode-stage variant of the layer-dump (prefill-vs-decode invariance harness): when this
+    flag is ALSO present, dump the per-layer residual for every decode step, keyed by the
+    absolute context position (``batch.positions[-1]``), so a full-prefill dump and an
+    incremental-decode dump of the same sequence are directly comparable position-by-position."""
+    return os.path.exists(r"D:\temp\opencode\ft_hidden_dump_decode.flag")
+
+
 def _prefill_barrier() -> bool:
     return os.getenv("FREETOKEN_PREFILL_BARRIER", "1") not in ("0", "false", "no", "off")
 
@@ -220,6 +228,12 @@ class Qwen4ExpModel(BaseOP):
             # initial embedding stream, keyed by input ids so the warmup prefill is ignored
             hdump = {"key": tuple(input_ids.cpu().tolist()), "states": [], "mid": []}
             _mid_collector = hdump["mid"]
+        elif _hidden_dump_decode_on() and batch.is_decode:
+            try:
+                pos = int(batch.positions[-1].cpu().item())
+            except Exception:  # pragma: no cover
+                pos = -1
+            hdump = {"pos": pos, "states": []}
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -277,17 +291,25 @@ class Qwen4ExpModel(BaseOP):
                 import hashlib
                 import numpy as np
 
-                key = "-".join(str(i) for i in hdump["key"])
-                digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
                 out_dir = r"D:\temp\opencode\ft_hidden_dump"
                 os.makedirs(out_dir, exist_ok=True)
-                arrays = {"input_ids": np.asarray(hdump["key"], dtype=np.int32)}
-                for li, st in enumerate(hdump["states"]):
-                    arrays[f"layer_{li}"] = st.numpy()
-                for li, stage, st in hdump["mid"]:
-                    arrays[f"{stage}_{li}"] = st.numpy()
-                np.savez_compressed(os.path.join(out_dir, f"{digest}.npz"), **arrays)
-                _model_logger.info("HIDDENDUMP wrote ntok=%d layers=%d key=%s", len(hdump["key"]), len(hdump["states"]), digest)
+                if "pos" in hdump:
+                    fname = f"decode_pos_{hdump['pos']:04d}.npz"
+                    arrays = {"pos": np.asarray(hdump["pos"], dtype=np.int32)}
+                    for li, st in enumerate(hdump["states"]):
+                        arrays[f"layer_{li}"] = st.numpy()
+                    np.savez_compressed(os.path.join(out_dir, fname), **arrays)
+                    _model_logger.info("HIDDENDUMP decode pos=%d layers=%d", hdump["pos"], len(hdump["states"]))
+                else:
+                    key = "-".join(str(i) for i in hdump["key"])
+                    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+                    arrays = {"input_ids": np.asarray(hdump["key"], dtype=np.int32)}
+                    for li, st in enumerate(hdump["states"]):
+                        arrays[f"layer_{li}"] = st.numpy()
+                    for li, stage, st in hdump["mid"]:
+                        arrays[f"{stage}_{li}"] = st.numpy()
+                    np.savez_compressed(os.path.join(out_dir, f"{digest}.npz"), **arrays)
+                    _model_logger.info("HIDDENDUMP wrote ntok=%d layers=%d key=%s", len(hdump["key"]), len(hdump["states"]), digest)
             except Exception:  # pragma: no cover
                 pass
         _mid_collector = None
