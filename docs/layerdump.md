@@ -39,12 +39,19 @@ fp32-clean, so the open question was: which decoder layer first diverges with RE
 2. **DOMINANT — the MoE block output (`mlp_out`).** Even after the dense-path fix, `mlp_out`
    stays ~30% relative (abs ~0.013 ≈ 4× the input error) at layer 0, length-independent (3/4/18
    tokens), and it propagates: residual rel grows 0.25 → 0.75 over layers 0..47 (~100× depth
-   amplification), which is what produces the 9–14 logprob delta. The MoE path does not use
-   `build_lora_mm`: FreeToken's prefill dequantizes the I-quant (IQ4) experts to **BF16** +
-   torch GEMM, while llama uses quantized expert kernels with quantized activations.
+   amplification), which is what produces the 9–14 logprob delta.
+   **Correction after code review (verified with the reviewer's finding):** the routed-MoE path
+   does **not** use a BF16-dequant+torch-GEMM. `fmt=="gguf"` (layers/moe.py:619) → `fused_experts_gguf`
+   → `ggml_moe_a8_vec` (`kernel/csrc/gguf/gguf_kernel.cu:566-568`), which quantizes the activation
+   to **Q8_1 itself** — the *same* kernel llama.cpp uses. The BF16 fallback (moe.py:588) only
+   handles genuinely-BF16 experts (not this checkpoint). So FreeToken-GPU and llama-GPU share the
+   a8/Q8_1 expert numerics, and the ~30% against our llama-**CPU** reference is most plausibly a
+   CPU-vs-GPU reference artifact (llama-CPU dequantizes experts to fp32 without a8) and/or a
+   routing/assembly difference — to be tested against llama-GPU (which the GUI already uses, `-ngl 99`).
 
-Neither is a FreeToken bug — both are llama.cpp/ggml numerical-path behaviors that a fp32-clean
-FreeToken cannot reproduce exactly.
+Neither is a FreeToken bug — the CPU-reference differences come from llama.cpp/ggml numerical-path
+behaviors that a fp32-clean FreeToken cannot reproduce exactly; the GPU-vs-GPU baseline is the
+acceptance target.
 
 ## Reproduce / extend
 
@@ -60,14 +67,23 @@ python D:\temp\opencode\layerdump\layerdump_harness.py free --prompt-name div15 
 
 ## Open questions / next steps (good for review input)
 
-1. **MoE A/B with equalized input** — feed the same `mlp_in` through both MoE implementations and
-   compare `mlp_out` to separate *routing sensitivity* (top-k flips on tiny input diffs, corr
-   ≈0.96 suggests partial not total) from *expert numerics* (BF16 I-quant dequant vs quantized
-   kernels; is FP32 expert dequant the fix?). Highest-value next experiment.
-2. **Reference choice** — the user loop may compare against a **GPU** llama (f16 activations
-   instead of Q8_0/I-quant activation paths); that may shrink the whole divergence.
-3. Do we want FreeToken to *match* llama CPU bit-numerics (deliberately quantize activations), or
-   is llama/ggml supposed to match the canonical fp32 path instead?
+**Stage-1 router A/B already resolved (no new captures needed, from the saved `mlp_in` states):**
+at layer 0 the router logits agree (rel 0.39%, F32 router weight) and **top-1/top-4 expert
+selection is identical (overlap 1.0)** — so the layer-0 `mlp_out` 30% is **not** a routing flip.
+Deep layers (≥20) do diverge in routing, but only because the compounded residual drift (mlp_in
+~10%) flips top-k — a consequence, not the root cause. Remaining explanation for layer 0: expert
+GEMM numerics (llama-CPU fp32-dequant experts vs FreeToken's shared a8/q8_1 kernel).
+
+1. **Definition / proof options for "expert GEMM numerics (CPU-vs-GPU)"**:
+   - Run a true full-GPU llama (a8 MoE + f32 dense) — blocked here by 16 GB VRAM vs 83.8 GB model.
+   - Offline stage-2/3 replay: dequant the selected IQ3_XXS/IQ4_XS/IQ4_NL expert weights to fp32
+     and replay (a) fp32 and (b) q8_1-activation trajectories against the captured `mlp_out`.
+   This distinguishes activation-rounding magnitude from an output-scale/assembly bug.
+2. **Review verdict followed:** do NOT chase llama-CPU bit-numerics; target qualitative
+   equivalence vs llama-**GPU** (which the GUI already uses). Whether llama/ggml should instead
+   match the canonical fp32 path on CPU remains a llama.cpp-side question.
+3. Historical "9–14 logprob" band is not reproduced by shared top-10 deltas (~2–3 at div15);
+   worth re-deriving the original metric before treating it as ground truth.
 
 ## Artifacts
 
