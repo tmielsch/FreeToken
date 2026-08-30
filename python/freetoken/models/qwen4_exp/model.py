@@ -36,9 +36,21 @@ if TYPE_CHECKING:
 
 _model_logger = init_logger("freetoken.qwen4exp.model")
 
+# set to a list by Qwen4ExpModel.forward while the hidden-dump flag is active; each layer
+# appends its mid-block states (attn_in / attn_out / mlp_in / mlp_out) for the layer harness
+_mid_collector: list | None = None
+
 
 def _prof_on() -> bool:
     return os.path.exists(r"D:\temp\opencode\ft_steptime.flag")
+
+
+def _hidden_dump_on() -> bool:
+    """Layer-dump harness gate (prefill only): dump the per-layer hyper-connection residual
+    to ``D:\\temp\\opencode\\ft_hidden_dump\\<input-hash>.npz`` as fp32. See the flag-gated
+    LOGIT-capture pattern in engine.py; this one is one-shot per prefill keyed by input ids
+    so the warmup prefill cannot poison the harness's dump."""
+    return os.path.exists(r"D:\temp\opencode\ft_hidden_dump.flag")
 
 
 def _prefill_barrier() -> bool:
@@ -93,6 +105,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         from freetoken.utils.gputime import timed
 
+        global _mid_collector
         prof = _prof_on()
         if prof and self._prof_acc is None:
             self._prof_acc = {"ple": 0.0, "attn": 0.0, "mlp": 0.0, "hc": 0.0}
@@ -111,14 +124,29 @@ class Qwen4ExpDecoderLayer(BaseOP):
         else:
             with timed("attn_qsa"):
                 block_output = self.self_attn.forward(block_input, batch)
+        if _mid_collector is not None:
+            _mid_collector.append(
+                (self._layer_id, "attn_in", block_input.detach().float().cpu())
+            )
+            _mid_collector.append(
+                (self._layer_id, "attn_out", block_output.detach().float().cpu())
+            )
         t3 = _t() if prof else None
         with timed("hc_attn_combine"):
             hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
         t4 = _t() if prof else None
         with timed("hc_mlp_mix"):
             block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        if _mid_collector is not None:
+            _mid_collector.append(
+                (self._layer_id, "mlp_in", block_input.detach().float().cpu())
+            )
         with timed("mlp"):
             blk = self.mlp.forward(block_input)
+        if _mid_collector is not None:
+            _mid_collector.append(
+                (self._layer_id, "mlp_out", blk.detach().float().cpu())
+            )
         t5 = _t() if prof else None
         with timed("hc_mlp_combine"):
             out = self.mlp_hyper_connection.combine(hidden, blk, inject)
@@ -184,7 +212,14 @@ class Qwen4ExpModel(BaseOP):
         _emb.table.stage(_host_ids, device)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        global _mid_collector
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hdump = None
+        if _hidden_dump_on() and not batch.is_decode:
+            # one-shot diagnostics: capture the fp32 residual after every layer, plus the
+            # initial embedding stream, keyed by input ids so the warmup prefill is ignored
+            hdump = {"key": tuple(input_ids.cpu().tolist()), "states": [], "mid": []}
+            _mid_collector = hdump["mid"]
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -212,6 +247,8 @@ class Qwen4ExpModel(BaseOP):
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
             hidden = layer.forward(hidden, batch)
+            if hdump is not None:
+                hdump["states"].append(hidden.detach().float().cpu())
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
@@ -235,6 +272,25 @@ class Qwen4ExpModel(BaseOP):
                 )
             except Exception:  # pragma: no cover
                 pass
+        if hdump is not None:
+            try:
+                import hashlib
+                import numpy as np
+
+                key = "-".join(str(i) for i in hdump["key"])
+                digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+                out_dir = r"D:\temp\opencode\ft_hidden_dump"
+                os.makedirs(out_dir, exist_ok=True)
+                arrays = {"input_ids": np.asarray(hdump["key"], dtype=np.int32)}
+                for li, st in enumerate(hdump["states"]):
+                    arrays[f"layer_{li}"] = st.numpy()
+                for li, stage, st in hdump["mid"]:
+                    arrays[f"{stage}_{li}"] = st.numpy()
+                np.savez_compressed(os.path.join(out_dir, f"{digest}.npz"), **arrays)
+                _model_logger.info("HIDDENDUMP wrote ntok=%d layers=%d key=%s", len(hdump["key"]), len(hdump["states"]), digest)
+            except Exception:  # pragma: no cover
+                pass
+        _mid_collector = None
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
