@@ -942,16 +942,26 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         _st_t0 = time.perf_counter()
+        _flag = os.path.exists(r"D:\temp\opencode\ft_steptime.flag")
+        if _flag and batch.is_decode:
+            _ev0 = torch.cuda.Event(enable_timing=True)
+            _ev0.record(self.stream)
         # Capture-safe PLE decode: stage the GGUF rows host-side BEFORE the forward/replay,
         # so the in-graph lookup is device-only (the host staging must live outside capture).
         _stage = getattr(self.model, "stage_ple_decode", None)
         if _stage is not None and batch.is_decode:
             _stage(batch, self.device)
+        if _flag and batch.is_decode:
+            _ev1 = torch.cuda.Event(enable_timing=True)
+            _ev1.record(self.stream)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
+        if _flag and batch.is_decode:
+            _ev2 = torch.cuda.Event(enable_timing=True)
+            _ev2.record(self.stream)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -969,6 +979,11 @@ class Engine:
                     batch.is_decode, len(batch.reqs),
                     (_st_t1 - _st_t0) * 1e3, (_st_t2 - _st_t1) * 1e3, _n,
                 )
+                if batch.is_decode:
+                    logger.info(
+                        "GPUTIM stage_ms=%.3f replay_ms=%.3f",
+                        _ev0.elapsed_time(_ev1), _ev1.elapsed_time(_ev2),
+                    )
             except Exception:  # pragma: no cover
                 pass
 

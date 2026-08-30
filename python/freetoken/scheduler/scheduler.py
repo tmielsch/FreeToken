@@ -251,7 +251,9 @@ class Scheduler(SchedulerIOMixin):
         # full_to_window INSIDE the captured graph, so an unordered drain can redirect an
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
+        _sched_t1 = time.perf_counter()
         self._process_last_data(last_data)
+        _sched_t2 = time.perf_counter()
         self._flush_abort_acks()
         if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
             try:
@@ -261,6 +263,13 @@ class Scheduler(SchedulerIOMixin):
                 if not _pref:
                     _last_step_wall[0] = _now
                     logger.info("SCHEDWALL decode=%s wall_ms=%.1f gap_ms=%.1f", (not _pref), (_now - _sched_t0) * 1e3, _gap)
+                    logger.info(
+                        "SCHEDSPLIT schedule_ms=%.1f fwd_ms=%.1f drain_ms=%.1f flush_ms=%.1f",
+                        (_sched_t0 - _last_step_wall[0]) * 1e3,
+                        (_sched_t1 - _sched_t0) * 1e3,
+                        (_sched_t2 - _sched_t1) * 1e3,
+                        (_now - _sched_t2) * 1e3,
+                    )
             except Exception:  # pragma: no cover
                 pass
         return ongoing_data
