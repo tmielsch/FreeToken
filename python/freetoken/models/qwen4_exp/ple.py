@@ -102,6 +102,7 @@ class ZeroTable:
         self.num_rows = int(num_rows)
         self.head_dim = head_dim
         self.dtype = dtype
+        self._staged_count = 0
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if out is not None:
@@ -113,6 +114,10 @@ class ZeroTable:
         )
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
+        return None
+
+    def stage(self, ids_host: torch.Tensor, device: torch.device) -> None:
+        # zero rows regardless of staging: host-side staging is a no-op by design
         return None
 
 
