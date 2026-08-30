@@ -1008,6 +1008,49 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if os.path.exists(r"D:\temp\opencode\ft_logit_capture.flag"):
+            # Logit-probability capture for the trajectory A/B harness: per step and per
+            # request, dump the top-10 token distribution (ids + ln-softmax logprobs) of
+            # every logits row plus the actually sampled token. Append-only JSONL; the
+            # harness truncates the file before a capture run. No seed exists, so the
+            # harness can only compare distributions / greedy trajectories.
+            try:
+                import json
+
+                _cap_path = r"D:\temp\opencode\ft_logit_capture.jsonl"
+                _nxt = next_tokens_gpu.to("cpu", non_blocking=False).tolist()  # sync D2H; diagnosis mode only
+                with open(_cap_path, "a", encoding="utf-8") as _cap_f:
+                    for _r_i, _req in enumerate(batch.reqs[: batch.size]):
+                        _lg = batch_logits[_r_i]
+                        _vocab = _lg.shape[-1]
+                        _lg = _lg.reshape(-1, _vocab).float()
+                        _top = torch.topk(_lg, min(10, _vocab))
+                        _lse = torch.logsumexp(_lg, dim=-1)
+                        _rows = [
+                            {
+                                "top10_ids": _top.indices[_r].tolist(),
+                                "top10_logprobs": [
+                                    round(float(v), 6)
+                                    for v in (_top.values[_r] - _lse[_r]).tolist()
+                                ],
+                            }
+                            for _r in range(_lg.shape[0])
+                        ]
+                        _cap_f.write(
+                            json.dumps(
+                                {
+                                    "ts": time.perf_counter(),
+                                    "decode": bool(batch.is_decode),
+                                    "uid": int(_req.uid),
+                                    "ntok": int(_req.input_ids.numel()),
+                                    "rows": _rows,
+                                    "sampled_id": int(_nxt[_r_i]),
+                                }
+                            )
+                            + "\n"
+                        )
+            except Exception:  # pragma: no cover
+                pass
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()

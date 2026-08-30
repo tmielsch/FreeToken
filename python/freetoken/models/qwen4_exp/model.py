@@ -91,27 +91,37 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        from freetoken.utils.gputime import timed
+
         prof = _prof_on()
         if prof and self._prof_acc is None:
             self._prof_acc = {"ple": 0.0, "attn": 0.0, "mlp": 0.0, "hc": 0.0}
         acc = self._prof_acc
         t0 = _t() if prof else None
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden, batch)
+            with timed("ple"):
+                hidden = hidden + self.ple.forward(hidden, batch)
         t1 = _t() if prof else None
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        with timed("hc_attn_mix"):
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
         t2 = _t() if prof else None
         if self._is_linear:
-            block_output = self.linear_attn.forward(block_input)
+            with timed("attn_linear"):
+                block_output = self.linear_attn.forward(block_input)
         else:
-            block_output = self.self_attn.forward(block_input, batch)
+            with timed("attn_qsa"):
+                block_output = self.self_attn.forward(block_input, batch)
         t3 = _t() if prof else None
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        with timed("hc_attn_combine"):
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
         t4 = _t() if prof else None
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        blk = self.mlp.forward(block_input)
+        with timed("hc_mlp_mix"):
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        with timed("mlp"):
+            blk = self.mlp.forward(block_input)
         t5 = _t() if prof else None
-        out = self.mlp_hyper_connection.combine(hidden, blk, inject)
+        with timed("hc_mlp_combine"):
+            out = self.mlp_hyper_connection.combine(hidden, blk, inject)
         t6 = _t() if prof else None
         if acc is not None:
             acc["ple"] += t1 - t0
@@ -206,6 +216,9 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        from freetoken.utils.gputime import flush as _gputime_flush
+
+        _gputime_flush()
         if _prof_on():
             try:
                 acc = {"ple": 0.0, "attn": 0.0, "mlp": 0.0, "hc": 0.0}
