@@ -22,9 +22,18 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    max_seq_len: int | None = None,  # host-side max request length (avoids a D2H sync in the
+                                     # triton fallback's .item()); caller knows it (prefill total)
+    batch: int | None = None,   # host-side request count (same reason)
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
-    in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
+    in place and refreshes ``conv_states[cache_indices]`` with each request's tail.
+
+    ``max_seq_len`` / ``batch`` are host-known in production (prefill lengths live on
+    the scheduler); passing them avoids the device->host ``.item()`` the triton
+    fallback otherwise needs for its launch grid. ``max_seq_len`` must be an UPPER
+    bound on every request length (total tokens satisfies this).
+    """
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
@@ -33,7 +42,8 @@ def causal_conv1d_varlen(
         )
 
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state,
+            max_seq_len=max_seq_len, batch=batch,
         )
 
     from sgl_kernel import causal_conv1d_fwd

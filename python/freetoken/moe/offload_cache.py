@@ -1327,27 +1327,7 @@ class OffloadMoeCache:
             n_valid = self.num_experts if routed is None else int(routed.reshape(-1).numel())
             _pf_t0 = _perf()
             if routed is not None:
-                routed = routed.reshape(-1).long()
-                if routed.numel() == 0:
-                    self._pending_prefill_ids = None
-                    return
-                routed_cpu = routed.to("cpu", non_blocking=False)
-                for per_layer, cache in self.banks:
-                    src = per_layer[layer_id]
-                    if int(routed.max()) >= src.shape[0] or int(routed.max()) >= cache.shape[0]:
-                        raise RuntimeError(
-                            f"_copy_missing_windows geom-prefill routed OOB layer={layer_id} "
-                            f"maxid={int(routed.max())} src_rows={src.shape[0]} cache_rows={cache.shape[0]}"
-                        )
-                    sel = src.index_select(0, routed_cpu)
-                    if sel.shape[1] > cache.shape[1]:
-                        raise RuntimeError(
-                            f"_copy_missing_windows geom-prefill routed col-OOB layer={layer_id} "
-                            f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
-                        )
-                    cache[:, : sel.shape[1]].index_copy_(
-                        0, routed, sel.to(cache.device, non_blocking=True)
-                    )
+                self._copy_routed_prefill_ids(layer_id, routed)
             else:
                 for per_layer, cache in self.banks:
                     src = per_layer[layer_id]
@@ -1445,6 +1425,51 @@ class OffloadMoeCache:
             sel = src.index_select(0, src_idx)
             cache[dst_slots, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
 
+    def _copy_routed_prefill_ids(self, layer_id: int, routed: torch.Tensor) -> None:
+        """Routed prefill staging: copy only the DISTINCT expert rows a GEMM will read.
+
+        topk_ids carries one entry per (token, expert) with repeats, so writing every
+        occurrence would copy the same rows N times (150 rows for a 15-token prompt at
+        topk=10). Collapse to the unique expert ids first (`~token*topk -> ~topk` rows),
+        then H2D once per bank. Positions are expert ids (position == expert id in the
+        prefill cache), so the dst rows equal the unique ids directly.
+
+        The gather runs into a PINNED staging buffer so the H2D is a true async
+        non-blocking copy: a pageable ``sel.to(device)`` is synchronous and would block
+        on the accumulated GPU queue at the end of a long prefill.
+        """
+        routed = routed.reshape(-1).long()
+        if routed.numel() == 0:
+            return
+        uniq = torch.unique(routed)  # [<=topk] distinct dst rows (sorted)
+        if int(uniq[0]) < 0:
+            # -1 padding slots must never be materialized.
+            uniq = uniq[uniq >= 0]
+        if uniq.numel() == 0:
+            return
+        uniq_cpu = uniq.to("cpu", non_blocking=False)
+        for per_layer, cache in self.banks:
+            src = per_layer[layer_id]
+            if int(uniq.max()) >= src.shape[0] or int(uniq.max()) >= cache.shape[0]:
+                raise RuntimeError(
+                    f"routed prefill OOB layer={layer_id} maxid={int(uniq.max())} "
+                    f"src_rows={src.shape[0]} cache_rows={cache.shape[0]}"
+                )
+            sel = torch.empty(
+                (uniq.numel(), src.shape[1]),
+                dtype=src.dtype,
+                pin_memory=True,
+            )
+            torch.index_select(src, 0, uniq_cpu, out=sel)
+            if sel.shape[1] > cache.shape[1]:
+                raise RuntimeError(
+                    f"routed prefill col-OOB layer={layer_id} "
+                    f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
+                )
+            cache[:, : sel.shape[1]].index_copy_(
+                0, uniq, sel[:, : cache.shape[1]].to(cache.device, non_blocking=True)
+            )
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
@@ -1460,17 +1485,9 @@ class OffloadMoeCache:
                 self._copy_missing_windows(layer_id)
                 return
         if self._pending_geometry_prefill:
-            routed = self._pending_prefill_ids
-            self._pending_prefill_ids = None
-            if routed is not None:
-                routed = routed.reshape(-1).long()
-                routed_cpu = routed.to("cpu", non_blocking=False)
-                for per_layer, cache in self.banks:
-                    src = per_layer[layer_id]
-                    sel = src.index_select(0, routed_cpu)
-                    cache[:, : sel.shape[1]].index_copy_(
-                        0, routed, sel.to(cache.device, non_blocking=True)
-                    )
+            if self._pending_prefill_ids is not None:
+                self._copy_routed_prefill_ids(layer_id, self._pending_prefill_ids)
+                self._pending_prefill_ids = None
                 return
             for per_layer, cache in self.banks:
                 self._copy_compact_layer(

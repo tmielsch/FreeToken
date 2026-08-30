@@ -128,8 +128,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
         li = pool.local_index(self.layer_id)
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
+        # Pass the host-side launch geometry (total tokens / request count) so the triton
+        # fallback needs no device->host .item() for its grid: that sync would wait out the
+        # whole accumulated prefill GPU queue every GDN layer.
+        max_seq_len = conv_in.shape[0]
+        batch = cu_seqlens.numel() - 1
         out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
+                                   cu_seqlens, cache_indices, has_initial_state,
+                                   max_seq_len=max_seq_len, batch=batch)
         return out.transpose(0, 1)  # [total, conv_dim]
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
