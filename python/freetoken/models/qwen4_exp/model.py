@@ -41,6 +41,10 @@ def _prof_on() -> bool:
     return os.path.exists(r"D:\temp\opencode\ft_steptime.flag")
 
 
+def _prefill_barrier() -> bool:
+    return os.getenv("FREETOKEN_PREFILL_BARRIER", "1") not in ("0", "false", "no", "off")
+
+
 def _t() -> float:
     return time.perf_counter()
 
@@ -184,6 +188,15 @@ class Qwen4ExpModel(BaseOP):
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
+            if _prefill_barrier() and not batch.is_decode:
+                # Shallow-queue barrier: without it the eager prefill enqueues ~340
+                # ops per layer (tvm-ffi + triton launches) far ahead of the GPU; the
+                # resulting deep driver queue makes every launch block ~0.3-0.7 ms on
+                # Windows (measured ~240 ms/layer -> 11.5 s for a 10-token prefill)
+                # while the true GPU cost is ~5 ms/layer. FreeToken's graphs only
+                # cover decode; the prefill stays eager, so pace it layer-wise.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             hidden = layer.forward(hidden, batch)
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's

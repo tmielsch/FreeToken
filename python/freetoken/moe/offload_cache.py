@@ -1426,37 +1426,86 @@ class OffloadMoeCache:
             cache[dst_slots, : sel.shape[1]] = sel.to(cache.device, non_blocking=True)
 
     def _copy_routed_prefill_ids(self, layer_id: int, routed: torch.Tensor) -> None:
-        """Routed prefill staging: copy only the DISTINCT expert rows a GEMM will read.
+        """Routed prefill staging: copy the expert rows a GEMM will read.
 
-        topk_ids carries one entry per (token, expert) with repeats, so writing every
-        occurrence would copy the same rows N times (150 rows for a 15-token prompt at
-        topk=10). Collapse to the unique expert ids first (`~token*topk -> ~topk` rows),
-        then H2D once per bank. Positions are expert ids (position == expert id in the
-        prefill cache), so the dst rows equal the unique ids directly.
+        topk_ids carries one entry per (token, expert) with repeats. Rows are copied
+        with duplicates left in place -- identical (src row -> dst row) pairs write
+        the same bytes, so the result equals a distinct-row copy. Collapsing to
+        distinct ids first would need a device sort (``torch.unique``) whose
+        internals sync the allocator per layer on Windows (~ms-tens of ms; measured
+        up to 90 ms/48 layers). Positions are expert ids (position == expert id in
+        the prefill cache), so the dst rows equal the ids directly.
 
-        The gather runs into a PINNED staging buffer so the H2D is a true async
-        non-blocking copy: a pageable ``sel.to(device)`` is synchronous and would block
-        on the accumulated GPU queue at the end of a long prefill.
+        The fused multi-bank kernel copies straight from the pinned host sources
+        into the cache rows in ONE launch per layer (device-side indices: no D2H
+        sync, no CPU index_select, no per-bank pinned staging or device temp). The
+        pure-torch fallback gathers into a PINNED staging buffer so its H2D is a
+        true async non-blocking copy: a pageable ``sel.to(device)`` is synchronous
+        and would block on the accumulated GPU queue at the end of a long prefill.
         """
         routed = routed.reshape(-1).long()
         if routed.numel() == 0:
             return
-        uniq = torch.unique(routed)  # [<=topk] distinct dst rows (sorted)
-        if int(uniq[0]) < 0:
-            # -1 padding slots must never be materialized.
-            uniq = uniq[uniq >= 0]
-        if uniq.numel() == 0:
+        # No distinctness, no boolean gather, no device sort: every intermediate here
+        # must keep a STATIC shape. ``t[mask]`` returns a variable-size tensor whose
+        # ``shape``/``numel()`` read triggers an implicit device->host sync per layer
+        # (measured 20-90 ms on this machine); ``torch.unique``'s sort does the same.
+        # Duplicate rows are idempotent (same src row -> same dst row; the GEMM reads
+        # the same experts), so the 100 entries pass through unchanged. -1 padding rows
+        # (decode-only) are rewritten to row 0, which the prefill GEMM never reads.
+        safe = torch.where(routed >= 0, routed, torch.zeros_like(routed))
+        if (
+            self._copy_fused_ok
+            and self.device.type == "cuda"
+            and routed.is_cuda
+            and layer_id not in self._unpinned_layers
+        ):
+            # Fused multi-bank H2D gather (the decode copy_missing path): ONE launch
+            # copies every bank's rows straight from the registered pinned host sources
+            # into the expert-id slot-cache rows. Device-side indices -> no per-layer
+            # D2H sync, no CPU index_select, and no per-bank pinned staging / device
+            # temp (which also churned the CUDA caching allocator every prefill layer).
+            from freetoken.kernel.fast_index_copy import (
+                fast_index_copy_multi_jit,
+                fast_index_copy_multi_strided_jit,
+            )
+
+            assert self._copy_dst_ptrs is not None and self._copy_src_ptrs is not None
+            if self.has_heterogeneous_rows:
+                assert (
+                    self._copy_payload_bytes is not None
+                    and self._copy_dst_row_strides is not None
+                    and self._copy_src_row_strides is not None
+                )
+                fast_index_copy_multi_strided_jit(
+                    self._copy_dst_ptrs,
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_payload_bytes[layer_id],
+                    self._copy_dst_row_strides,
+                    self._copy_src_row_strides[layer_id],
+                    safe,
+                    safe,
+                )
+            else:
+                assert self._copy_feat_bytes is not None
+                fast_index_copy_multi_jit(
+                    self._copy_dst_ptrs,
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_feat_bytes,
+                    safe,
+                    safe,
+                )
             return
-        uniq_cpu = uniq.to("cpu", non_blocking=False)
+        uniq_cpu = safe.to("cpu", non_blocking=False)
         for per_layer, cache in self.banks:
             src = per_layer[layer_id]
-            if int(uniq.max()) >= src.shape[0] or int(uniq.max()) >= cache.shape[0]:
+            if int(safe.max()) >= src.shape[0] or int(safe.max()) >= cache.shape[0]:
                 raise RuntimeError(
-                    f"routed prefill OOB layer={layer_id} maxid={int(uniq.max())} "
+                    f"routed prefill OOB layer={layer_id} maxid={int(safe.max())} "
                     f"src_rows={src.shape[0]} cache_rows={cache.shape[0]}"
                 )
             sel = torch.empty(
-                (uniq.numel(), src.shape[1]),
+                (safe.numel(), src.shape[1]),
                 dtype=src.dtype,
                 pin_memory=True,
             )
@@ -1467,7 +1516,7 @@ class OffloadMoeCache:
                     f"sel_cols={sel.shape[1]} cache_cols={cache.shape[1]}"
                 )
             cache[:, : sel.shape[1]].index_copy_(
-                0, uniq, sel[:, : cache.shape[1]].to(cache.device, non_blocking=True)
+                0, safe, sel[:, : cache.shape[1]].to(cache.device, non_blocking=True)
             )
 
     def copy_missing(self) -> None:

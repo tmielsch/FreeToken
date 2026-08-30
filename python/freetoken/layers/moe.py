@@ -420,11 +420,18 @@ class OffloadMoELayer(MoELayer):
             cache.release_prefill_layer(self.layer_id)
             return out
         if os.getenv("FREETOKEN_PREFILL_ROUTED", "0") == "1":
+            _pf_t0 = _moe_perf()
             cache.materialize_layer(self.layer_id, ids=topk_ids)
+            _pf_t1 = _moe_perf()
+            cache.copy_missing()
+            _pf_t2 = _moe_perf()
         else:
+            _pf_t0 = _moe_perf()
             cache.materialize_layer(self.layer_id)
-        cache.copy_missing()
-        return self._expert_gemm(
+            _pf_t1 = _moe_perf()
+            cache.copy_missing()
+            _pf_t2 = _moe_perf()
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -434,6 +441,20 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        if os.path.exists(r"D:\temp\opencode\ft_steptime.flag"):
+            try:
+                from freetoken.utils.logger import init_logger
+
+                init_logger("freetoken.layers.moe").info(
+                    "MOEPRF layer=%d mat_ms=%.1f copy_ms=%.1f gemm_ms=%.1f",
+                    self.layer_id,
+                    (_pf_t1 - _pf_t0) * 1e3,
+                    (_pf_t2 - _pf_t1) * 1e3,
+                    (_moe_perf() - _pf_t2) * 1e3,
+                )
+            except Exception:  # pragma: no cover
+                pass
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
