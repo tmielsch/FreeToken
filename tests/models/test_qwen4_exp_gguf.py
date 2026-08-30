@@ -86,6 +86,7 @@ def test_qwen4exp_gguf_config_matches_released_geometry(monkeypatch):
     assert config.head_dim == 256
     assert config.num_experts == 512
     assert config.num_experts_per_tok == 10
+    assert config.norm_topk_prob is True  # top-10 router weights are renormalized (llama.cpp norm_w=true)
     assert config.moe_intermediate_size == 640
     assert config.shared_expert_intermediate_size == 640
     assert config.expert_quant == "gguf"

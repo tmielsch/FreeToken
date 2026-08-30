@@ -295,7 +295,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         num_experts_per_tok=int(g("expert_used_count")),
         moe_intermediate_size=int(g("expert_feed_forward_length")),
         shared_expert_intermediate_size=int(g("expert_shared_feed_forward_length")),
-        norm_topk_prob=False,
+        norm_topk_prob=True,  # Qwen MoE renormalizes top-k router weights; llama.cpp qwen4exp hardcodes norm_w=true regardless of GGUF keys
         model_type="qwen4exp",
         architectures=list(shim.architectures),
         moe_enabled=True,
