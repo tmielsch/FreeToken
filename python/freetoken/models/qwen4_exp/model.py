@@ -146,11 +146,12 @@ class Qwen4ExpModel(BaseOP):
         Computes the ngram row ids on the host from each request's token history and gathers
         the GGUF rows into the persistent device staging buffer (``GGUFPLETableBackend.stage``).
         The in-forward ``lookup`` then only dequantizes that buffer (capture-safe, no D2H sync).
-        No-op unless ``FREETOKEN_PLE_HOST=1`` and the batch is a decode.
+        On by default (CUDA-graph decode needs it); FREETOKEN_PLE_HOST=0 disables. No-op when
+        the batch is not a decode.
         """
         if not self._ple or not batch.is_decode:
             return
-        if os.getenv("FREETOKEN_PLE_HOST", "0") != "1":
+        if os.getenv("FREETOKEN_PLE_HOST", "1") in ("0", "false", "no", "off"):
             return
         from .ple import build_ple_metadata, host_decode_ngram_ids
 
@@ -183,7 +184,10 @@ class Qwen4ExpModel(BaseOP):
             # The capture-safe decode path stages rows OUTSIDE the forward (stage_ple_decode
             # from the engine, before replay). Any other path (prefill, non-host decode) must
             # invalidate a stale staging so lookups never consume leftovers.
-            if not (os.getenv("FREETOKEN_PLE_HOST", "0") == "1" and batch.is_decode):
+            if not (
+                os.getenv("FREETOKEN_PLE_HOST", "1") not in ("0", "false", "no", "off")
+                and batch.is_decode
+            ):
                 _tbl._staged_count = 0
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)

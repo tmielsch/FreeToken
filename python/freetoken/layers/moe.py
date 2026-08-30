@@ -419,7 +419,7 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
-        if os.getenv("FREETOKEN_PREFILL_ROUTED", "0") == "1":
+        if os.getenv("FREETOKEN_PREFILL_ROUTED", "1") not in ("0", "false", "no", "off"):
             _pf_t0 = _moe_perf()
             cache.materialize_layer(self.layer_id, ids=topk_ids)
             _pf_t1 = _moe_perf()

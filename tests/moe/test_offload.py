@@ -76,7 +76,14 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         "freetoken.layers.moe.fused_topk",
         lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
     )
-    monkeypatch.setattr(cache, "materialize_layer", lambda layer_id: calls.setdefault("layer_id", layer_id))
+    monkeypatch.setattr(
+        cache,
+        "materialize_layer",
+        lambda layer_id, ids=None: (
+            calls.setdefault("layer_id", layer_id),
+            calls.setdefault("routed_ids", ids),
+        )[0],
+    )
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
 
     def fake_fused(
@@ -101,6 +108,8 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
     assert out is hidden_states
     assert calls["layer_id"] == 0
     assert calls["copied"] is True
+    # FREETOKEN_PREFILL_ROUTED is default-on: routed-only staging passes ids through
+    assert calls["routed_ids"] is topk_ids
     assert calls["w1"].shape[0] == layer.num_experts
     assert calls["w2"].shape[0] == layer.num_experts
     assert calls["w1"].data_ptr() == cache.bank_caches["gate_up"].data_ptr()

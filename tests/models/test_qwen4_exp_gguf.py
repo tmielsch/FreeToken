@@ -99,8 +99,9 @@ def test_qwen4exp_gguf_config_matches_released_geometry(monkeypatch):
     assert config.qwen4_args.gguf_embed_quant == GGML_Q8_0
     assert len(config.qwen4_args.gguf_expert_types) == 48
     assert {s.name for s in config.slot_states} == {"ple_conv", "ple_ngram_ctx"}
-    # Host-side PLE gathers are not capture-safe: the engine must serve eager.
-    assert config.supports_cuda_graph is False
+    # PLE staging is host-side and capture-safe (FREETOKEN_PLE_HOST): CUDA-graph
+    # decode is on by default; FREETOKEN_CAPTURE=0 opts back into eager.
+    assert config.supports_cuda_graph is True
     assert config.is_linear_layer(0)
     assert config.is_linear_layer(1)
     assert config.is_linear_layer(2)

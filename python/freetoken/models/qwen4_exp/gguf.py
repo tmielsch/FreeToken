@@ -314,8 +314,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
         requires_naive_cache=True,
-        # Control: eager while isolating the capture-kill (FREETOKEN_CAPTURE=1 re-enables).
-        supports_cuda_graph=os.getenv("FREETOKEN_CAPTURE", "0") == "1",
+        # CUDA-graph decode on by default (capture-safe PLE host staging is verified);
+        # FREETOKEN_CAPTURE=0 falls back to eager.
+        supports_cuda_graph=os.getenv("FREETOKEN_CAPTURE", "1") not in ("0", "false", "no", "off"),
     )
 
 
